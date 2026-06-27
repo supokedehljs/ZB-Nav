@@ -16,7 +16,7 @@ from bpy_extras import view3d_utils
 
 ADDON_KEYMAPS = []
 NAV_MODE_PROP = "zb_nav_mode"
-TOPBAR_REGISTERED_PROP = "_zb_nav_buttons_registered"
+HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 
 ZBRUSH_KEYMAP_ITEMS = [
     {
@@ -270,11 +270,11 @@ class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
         return {"FINISHED"}
 
 
-def draw_topbar_buttons(self, context):
+def draw_view3d_header_buttons(self, context):
     layout = self.layout
     mode = get_nav_mode(context)
     row = layout.row(align=True)
-    row.separator_spacer()
+    row.separator()
 
     blender = row.operator(
         ZBNAV_OT_set_navigation_mode.bl_idname,
@@ -291,13 +291,21 @@ def draw_topbar_buttons(self, context):
     zbrush.mode = "ZBRUSH"
 
 
-def cleanup_topbar_buttons():
-    topbar = bpy.types.TOPBAR_HT_upper_bar
+def register_view3d_header_buttons():
+    header = bpy.types.VIEW3D_HT_header
+    if getattr(header, HEADER_REGISTERED_PROP, False):
+        return
+    header.append(draw_view3d_header_buttons)
+    setattr(header, HEADER_REGISTERED_PROP, True)
+
+
+def unregister_view3d_header_buttons():
+    header = bpy.types.VIEW3D_HT_header
     try:
-        topbar.remove(draw_topbar_buttons)
+        header.remove(draw_view3d_header_buttons)
     except (ReferenceError, RuntimeError, ValueError):
         pass
-    setattr(topbar, TOPBAR_REGISTERED_PROP, False)
+    setattr(header, HEADER_REGISTERED_PROP, False)
 
 
 CLASSES = (
@@ -310,12 +318,7 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-
-    topbar = bpy.types.TOPBAR_HT_upper_bar
-    if not getattr(topbar, TOPBAR_REGISTERED_PROP, False):
-        topbar.append(draw_topbar_buttons)
-        setattr(topbar, TOPBAR_REGISTERED_PROP, True)
-
+    register_view3d_header_buttons()
     set_nav_mode(bpy.context, "BLENDER")
 
 
@@ -323,6 +326,6 @@ def unregister():
     remove_zbrush_keymaps()
     if hasattr(bpy.context, "window_manager"):
         bpy.context.window_manager.pop(NAV_MODE_PROP, None)
-    cleanup_topbar_buttons()
+    unregister_view3d_header_buttons()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
