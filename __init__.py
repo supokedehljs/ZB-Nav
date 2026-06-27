@@ -20,11 +20,23 @@ HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 
 ZBRUSH_KEYMAP_ITEMS = [
     {
+        "keymap": "3D View",
+        "space_type": "VIEW_3D",
         "idname": "zb_nav.pan_or_zoom",
         "type": "MIDDLEMOUSE",
         "value": "PRESS",
         "alt": True,
         "properties": {},
+    },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "wm.call_panel",
+        "type": "SPACE",
+        "value": "PRESS",
+        "properties": {
+            "name": "VIEW3D_PT_sculpt_context_menu",
+        },
     },
 ]
 
@@ -93,8 +105,11 @@ def add_zbrush_keymaps():
     if not kc:
         return
 
-    km = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
     for item in ZBRUSH_KEYMAP_ITEMS:
+        km = kc.keymaps.new(
+            name=item.get("keymap", "3D View"),
+            space_type=item.get("space_type", "EMPTY"),
+        )
         props = item.get("properties", {})
         kmi = km.keymap_items.new(
             item["idname"],
