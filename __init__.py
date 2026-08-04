@@ -15,6 +15,7 @@ from bpy.props import EnumProperty, FloatProperty
 from bpy_extras import view3d_utils
 
 ADDON_KEYMAPS = []
+SCULPT_BRUSH_MODIFIERS = []
 NAV_MODE_PROP = "zb_nav_mode"
 HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 
@@ -97,8 +98,40 @@ def remove_zbrush_keymaps():
     ADDON_KEYMAPS.clear()
 
 
+def swap_sculpt_brush_modifiers():
+    restore_sculpt_brush_modifiers()
+    wm = bpy.context.window_manager
+    keyconfig = wm.keyconfigs.user
+    if not keyconfig:
+        return
+
+    sculpt_keymap = keyconfig.keymaps.get("Sculpt")
+    if not sculpt_keymap:
+        return
+
+    for keymap_item in sculpt_keymap.keymap_items:
+        if keymap_item.idname != "sculpt.brush_stroke" or keymap_item.type != "LEFTMOUSE":
+            continue
+        if keymap_item.ctrl == keymap_item.alt:
+            continue
+
+        SCULPT_BRUSH_MODIFIERS.append((keymap_item, keymap_item.ctrl, keymap_item.alt))
+        keymap_item.ctrl, keymap_item.alt = keymap_item.alt, keymap_item.ctrl
+
+
+def restore_sculpt_brush_modifiers():
+    for keymap_item, ctrl, alt in SCULPT_BRUSH_MODIFIERS:
+        try:
+            keymap_item.ctrl = ctrl
+            keymap_item.alt = alt
+        except (ReferenceError, RuntimeError):
+            pass
+    SCULPT_BRUSH_MODIFIERS.clear()
+
+
 def add_zbrush_keymaps():
     remove_zbrush_keymaps()
+    swap_sculpt_brush_modifiers()
 
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
@@ -130,6 +163,7 @@ def update_navigation_mode(context, mode):
         add_zbrush_keymaps()
     else:
         remove_zbrush_keymaps()
+        restore_sculpt_brush_modifiers()
     set_nav_mode(context, mode)
 
 
@@ -170,12 +204,18 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
     bl_description = "按住 Alt + 鼠标中键拖动平移，拖动中松开 Alt 切换为缩放"
     bl_options = {"REGISTER", "BLOCKING", "GRAB_CURSOR"}
 
+    _start_mouse_x = 0
+    _start_mouse_y = 0
     _last_mouse_x = 0
     _last_mouse_y = 0
     _region = None
     _region_3d = None
+    _start_view_location = None
+    _start_view_distance = 0.0
     _last_depth_location = None
     _pivot_location = None
+    _was_alt_pressed = True
+    _converted_pan_to_zoom = False
 
     @classmethod
     def poll(cls, context):
@@ -184,8 +224,12 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
     def invoke(self, context, event):
         self._region = context.region
         self._region_3d = context.region_data
+        self._start_mouse_x = event.mouse_region_x
+        self._start_mouse_y = event.mouse_region_y
         self._last_mouse_x = event.mouse_region_x
         self._last_mouse_y = event.mouse_region_y
+        self._start_view_location = self._region_3d.view_location.copy()
+        self._start_view_distance = self._region_3d.view_distance
         self._last_depth_location = find_depth_location(
             context,
             self._region,
@@ -193,7 +237,9 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
             event.mouse_region_x,
             event.mouse_region_y,
         )
-        self._pivot_location = self._last_depth_location
+        self._pivot_location = self._last_depth_location or self._start_view_location.copy()
+        self._was_alt_pressed = event.alt
+        self._converted_pan_to_zoom = False
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
@@ -211,8 +257,12 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
                 if event.alt:
                     self._pan_view(context, current_x, current_y)
                 else:
-                    self._zoom_view(context, current_x, current_y, dx, dy)
+                    if self._was_alt_pressed and not self._converted_pan_to_zoom:
+                        self._convert_pan_preview_to_zoom(context, current_x, current_y)
+                    else:
+                        self._zoom_view(context, current_x, current_y, dx, dy)
 
+                self._was_alt_pressed = event.alt
                 self._last_mouse_x = current_x
                 self._last_mouse_y = current_y
                 context.area.tag_redraw()
@@ -246,15 +296,29 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
         self._last_depth_location = new_depth or depth_location
         self._pivot_location = self._last_depth_location
 
+    def _convert_pan_preview_to_zoom(self, context, current_x, current_y):
+        self._region_3d.view_location = self._start_view_location.copy()
+        self._region_3d.view_distance = self._start_view_distance
+        self._zoom_view(
+            context,
+            current_x,
+            current_y,
+            current_x - self._start_mouse_x,
+            current_y - self._start_mouse_y,
+        )
+        self._converted_pan_to_zoom = True
+
     def _zoom_view(self, context, current_x, current_y, dx, dy):
         focus_location = find_depth_location(context, self._region, self._region_3d, current_x, current_y)
         if focus_location is None:
-            focus_location = self._pivot_location or self._last_depth_location or self._region_3d.view_location
+            focus_location = self._pivot_location or self._last_depth_location or self._start_view_location
 
         prefs = get_preferences(context)
         sensitivity = prefs.zoom_sensitivity if prefs else 1.0
         previous_distance = max(self._region_3d.view_distance, 0.0001)
-        delta = dx + dy
+        # Blender's region Y coordinate increases upward; invert it so screen-down
+        # contributes in the same direction as screen-right, matching ZBrush.
+        delta = dx - dy
         zoom_factor = math.exp(-delta * 0.01 * sensitivity)
         new_distance = max(previous_distance * zoom_factor, 0.0001)
         ratio = new_distance / previous_distance
@@ -339,6 +403,7 @@ def register():
 
 def unregister():
     remove_zbrush_keymaps()
+    restore_sculpt_brush_modifiers()
     if hasattr(bpy.context, "window_manager"):
         bpy.context.window_manager.pop(NAV_MODE_PROP, None)
     unregister_view3d_header_buttons()
