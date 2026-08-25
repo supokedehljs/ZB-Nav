@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 10, 0),
+    "version": (1, 10, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1058,15 +1058,40 @@ class ZBNAV_OT_ctrl_mask_guard(bpy.types.Operator):
     def poll(cls, context):
         return is_zbrush_sculpt_mode(context)
 
+    def _try_start_gesture(self, context):
+        try:
+            bpy.ops.paint.mask_lasso_gesture("INVOKE_DEFAULT")
+            return True
+        except Exception:
+            pass
+        try:
+            with bpy.context.temp_override(
+                area=context.area,
+                region=context.region,
+                region_data=context.region_data,
+            ):
+                bpy.ops.paint.mask_lasso_gesture("INVOKE_DEFAULT")
+            return True
+        except Exception as exc:
+            self.report({"WARNING"}, f"套索遮罩启动失败：{exc}")
+            return False
+
     def invoke(self, context, event):
         if not (event.ctrl and event.type == "LEFTMOUSE" and event.value == "PRESS"):
             return {"PASS_THROUGH"}
 
         # Cursor over the sculpt mesh: let the normal mask stroke run.
-        if is_cursor_over_sculpt_mesh(context, event):
+        try:
+            if is_cursor_over_sculpt_mesh(context, event):
+                return {"PASS_THROUGH"}
+        except Exception:
             return {"PASS_THROUGH"}
 
-        # Empty space: start a lasso-mask drag.
+        # Empty space: prefer Blender's own lasso-mask gesture.
+        if self._try_start_gesture(context):
+            return {"FINISHED"}
+
+        # Fallback: collect the lasso in our own modal and apply on release.
         global CTRL_LASSO_ACTIVE, CTRL_LASSO_POINTS
         CTRL_LASSO_ACTIVE = True
         CTRL_LASSO_POINTS = [(event.mouse_region_x, event.mouse_region_y)]
@@ -1098,12 +1123,17 @@ class ZBNAV_OT_ctrl_mask_guard(bpy.types.Operator):
                 context.area.tag_redraw()
             if len(points) >= 3:
                 try:
-                    bpy.ops.paint.mask_lasso_gesture(
-                        "EXEC_DEFAULT",
-                        path=[(float(x), float(y)) for (x, y) in points],
-                    )
-                except Exception:
-                    pass
+                    with bpy.context.temp_override(
+                        area=context.area,
+                        region=context.region,
+                        region_data=context.region_data,
+                    ):
+                        bpy.ops.paint.mask_lasso_gesture(
+                            "EXEC_DEFAULT",
+                            path=[(float(x), float(y)) for (x, y) in points],
+                        )
+                except Exception as exc:
+                    self.report({"WARNING"}, f"套索遮罩应用失败：{exc}")
             return {"FINISHED"}
 
         if event.type == "MOUSEMOVE":
