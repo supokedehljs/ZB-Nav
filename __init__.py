@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 4),
+    "version": (1, 9, 5),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -715,7 +715,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
                 get_brush_size_method(context),
             )
         )
-        brush_box.label(text="点按空格进入，左键拖动调整（类似 F）", icon="MOUSE_LMB")
+        brush_box.label(text="点按空格进入 · 左键拖动调整 · 松开空格确认", icon="MOUSE_LMB")
         prefs = get_preferences(context)
         if prefs:
             brush_box.prop(prefs, "brush_size_sensitivity", text="拖动灵敏度")
@@ -875,6 +875,8 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
 
         if event.type == "SPACE":
             if event.value == "RELEASE":
+                if self._adjusted:
+                    return self._finish(context)
                 self._space_released = True
             elif event.value == "PRESS" and self._space_released and not self._left_mouse_down:
                 return self._finish(context)
@@ -934,7 +936,7 @@ class ZBNAV_OT_space_brush_size_direct(ZBNAV_BrushSizeMixin, bpy.types.Operator)
     def modal(self, context, event):
         if not is_zbrush_sculpt_mode(context):
             return {"CANCELLED"}
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+        if event.type in {"LEFTMOUSE", "SPACE"} and event.value == "RELEASE":
             return {"FINISHED"}
         if event.type == "ESC" and event.value == "PRESS":
             return {"FINISHED"}
