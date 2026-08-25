@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 10, 1),
+    "version": (1, 10, 2),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -26,10 +26,7 @@ NAV_MODE_PROP = "zb_nav_mode"
 HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 VIEW3D_DRAW_HANDLER = None
 BRUSH_SIZE_OVERLAY_HANDLER = None
-CTRL_LASSO_DRAW_HANDLER = None
 BRUSH_SIZE_OVERLAY_ACTIVE = False
-CTRL_LASSO_ACTIVE = False
-CTRL_LASSO_POINTS = []
 MAX_BRUSH_SIZE = 5000
 BRUSH_SIZE_METHOD_PROP = "zb_nav_brush_size_method"
 BRUSH_SIZE_METHODS = {
@@ -79,7 +76,16 @@ ZBRUSH_KEYMAP_ITEMS = [
     {
         "keymap": "Sculpt",
         "space_type": "EMPTY",
-        "idname": "zb_nav.ctrl_mask_guard",
+        "idname": "sculpt.brush_stroke",
+        "type": "LEFTMOUSE",
+        "value": "PRESS",
+        "ctrl": True,
+        "properties": {"ignore_background_click": True},
+    },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "paint.mask_lasso_gesture",
         "type": "LEFTMOUSE",
         "value": "PRESS",
         "ctrl": True,
@@ -341,11 +347,6 @@ def find_object_under_mouse(context, mouse_x, mouse_y):
     return None
 
 
-def is_cursor_over_sculpt_mesh(context, event):
-    obj = find_object_under_mouse(context, event.mouse_region_x, event.mouse_region_y)
-    return obj is context.object
-
-
 def is_valid_sculpt_target(context, obj):
     if not obj or obj.type != "MESH":
         return False
@@ -467,15 +468,13 @@ def add_zbrush_keymaps():
 
 
 def update_navigation_mode(context, mode):
-    global BRUSH_SIZE_OVERLAY_ACTIVE, CTRL_LASSO_ACTIVE, CTRL_LASSO_POINTS
+    global BRUSH_SIZE_OVERLAY_ACTIVE
     if mode == "ZBRUSH":
         if context.mode != "SCULPT":
             return False
         add_zbrush_keymaps()
     else:
         BRUSH_SIZE_OVERLAY_ACTIVE = False
-        CTRL_LASSO_ACTIVE = False
-        CTRL_LASSO_POINTS = []
         remove_zbrush_keymaps()
         restore_sculpt_brush_modifiers()
         restore_view_rotate_axis_snap()
@@ -1048,103 +1047,6 @@ class ZBNAV_OT_alt_select_or_invert(bpy.types.Operator):
         region_3d.view_location += previous - current
 
 
-class ZBNAV_OT_ctrl_mask_guard(bpy.types.Operator):
-    bl_idname = "zb_nav.ctrl_mask_guard"
-    bl_label = "Ctrl Mask / Lasso"
-    bl_description = "Ctrl + 左键在模型上使用遮罩笔刷，在空白区域拖出套索遮罩"
-    bl_options = {"INTERNAL", "BLOCKING"}
-
-    @classmethod
-    def poll(cls, context):
-        return is_zbrush_sculpt_mode(context)
-
-    def _try_start_gesture(self, context):
-        try:
-            bpy.ops.paint.mask_lasso_gesture("INVOKE_DEFAULT")
-            return True
-        except Exception:
-            pass
-        try:
-            with bpy.context.temp_override(
-                area=context.area,
-                region=context.region,
-                region_data=context.region_data,
-            ):
-                bpy.ops.paint.mask_lasso_gesture("INVOKE_DEFAULT")
-            return True
-        except Exception as exc:
-            self.report({"WARNING"}, f"套索遮罩启动失败：{exc}")
-            return False
-
-    def invoke(self, context, event):
-        if not (event.ctrl and event.type == "LEFTMOUSE" and event.value == "PRESS"):
-            return {"PASS_THROUGH"}
-
-        # Cursor over the sculpt mesh: let the normal mask stroke run.
-        try:
-            if is_cursor_over_sculpt_mesh(context, event):
-                return {"PASS_THROUGH"}
-        except Exception:
-            return {"PASS_THROUGH"}
-
-        # Empty space: prefer Blender's own lasso-mask gesture.
-        if self._try_start_gesture(context):
-            return {"FINISHED"}
-
-        # Fallback: collect the lasso in our own modal and apply on release.
-        global CTRL_LASSO_ACTIVE, CTRL_LASSO_POINTS
-        CTRL_LASSO_ACTIVE = True
-        CTRL_LASSO_POINTS = [(event.mouse_region_x, event.mouse_region_y)]
-        if context.area:
-            context.area.tag_redraw()
-        context.window_manager.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        global CTRL_LASSO_ACTIVE, CTRL_LASSO_POINTS
-        if not is_zbrush_sculpt_mode(context):
-            CTRL_LASSO_ACTIVE = False
-            CTRL_LASSO_POINTS = []
-            return {"CANCELLED"}
-
-        if event.type == "ESC" and event.value == "PRESS":
-            CTRL_LASSO_ACTIVE = False
-            CTRL_LASSO_POINTS = []
-            if context.area:
-                context.area.tag_redraw()
-            return {"CANCELLED"}
-
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            points = list(CTRL_LASSO_POINTS)
-            points.append((event.mouse_region_x, event.mouse_region_y))
-            CTRL_LASSO_ACTIVE = False
-            CTRL_LASSO_POINTS = []
-            if context.area:
-                context.area.tag_redraw()
-            if len(points) >= 3:
-                try:
-                    with bpy.context.temp_override(
-                        area=context.area,
-                        region=context.region,
-                        region_data=context.region_data,
-                    ):
-                        bpy.ops.paint.mask_lasso_gesture(
-                            "EXEC_DEFAULT",
-                            path=[(float(x), float(y)) for (x, y) in points],
-                        )
-                except Exception as exc:
-                    self.report({"WARNING"}, f"套索遮罩应用失败：{exc}")
-            return {"FINISHED"}
-
-        if event.type == "MOUSEMOVE":
-            CTRL_LASSO_POINTS.append((event.mouse_region_x, event.mouse_region_y))
-            if context.area:
-                context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
-        return {"RUNNING_MODAL"}
-
-
 class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
     bl_idname = "zb_nav.set_navigation_mode"
     bl_label = "Toggle ZBrush Sculpt Mode"
@@ -1219,43 +1121,8 @@ def draw_brush_size_overlay():
     blf.draw(font_id, "拖动调整 · 点击 / 空格 / Esc 退出")
 
 
-def draw_ctrl_lasso():
-    if not CTRL_LASSO_ACTIVE:
-        return
-    context = bpy.context
-    if not is_zbrush_sculpt_mode(context):
-        return
-
-    region = context.region
-    if not region or region.type != "WINDOW":
-        return
-
-    points = list(CTRL_LASSO_POINTS)
-    if len(points) < 2:
-        return
-
-    vertices = []
-    for i in range(len(points) - 1):
-        vertices.append((points[i][0], points[i][1]))
-        vertices.append((points[i + 1][0], points[i + 1][1]))
-    if len(points) >= 3:
-        vertices.append((points[-1][0], points[-1][1]))
-        vertices.append((points[0][0], points[0][1]))
-
-    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-    batch = batch_for_shader(shader, "LINES", {"pos": vertices})
-
-    gpu.state.blend_set("ALPHA")
-    gpu.state.line_width_set(2.0)
-    shader.bind()
-    shader.uniform_float("color", (0.0, 1.0, 0.0, 1.0))
-    batch.draw(shader)
-    gpu.state.line_width_set(1.0)
-    gpu.state.blend_set("NONE")
-
-
 def register_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER, CTRL_LASSO_DRAW_HANDLER
+    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER
     if VIEW3D_DRAW_HANDLER is None:
         VIEW3D_DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
             draw_zbrush_mode_border,
@@ -1270,17 +1137,10 @@ def register_view3d_draw_handler():
             "WINDOW",
             "POST_PIXEL",
         )
-    if CTRL_LASSO_DRAW_HANDLER is None:
-        CTRL_LASSO_DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
-            draw_ctrl_lasso,
-            (),
-            "WINDOW",
-            "POST_PIXEL",
-        )
 
 
 def unregister_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER, CTRL_LASSO_DRAW_HANDLER
+    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER
     if VIEW3D_DRAW_HANDLER is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(VIEW3D_DRAW_HANDLER, "WINDOW")
@@ -1293,12 +1153,6 @@ def unregister_view3d_draw_handler():
         except (ReferenceError, RuntimeError, ValueError):
             pass
         BRUSH_SIZE_OVERLAY_HANDLER = None
-    if CTRL_LASSO_DRAW_HANDLER is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(CTRL_LASSO_DRAW_HANDLER, "WINDOW")
-        except (ReferenceError, RuntimeError, ValueError):
-            pass
-        CTRL_LASSO_DRAW_HANDLER = None
 
 
 def draw_view3d_header_buttons(self, context):
@@ -1341,7 +1195,6 @@ CLASSES = (
     ZBNAV_OT_space_brush_size_direct,
     ZBNAV_OT_alt_select_target,
     ZBNAV_OT_alt_select_or_invert,
-    ZBNAV_OT_ctrl_mask_guard,
     ZBNAV_OT_set_navigation_mode,
 )
 
@@ -1373,9 +1226,6 @@ def register():
 
 
 def unregister():
-    global CTRL_LASSO_ACTIVE, CTRL_LASSO_POINTS
-    CTRL_LASSO_ACTIVE = False
-    CTRL_LASSO_POINTS = []
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
     restore_view_rotate_axis_snap()
