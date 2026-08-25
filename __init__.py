@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 3),
+    "version": (1, 9, 4),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -852,6 +852,7 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
         self._moved = False
         self._adjusted = False
         self._size_accumulator = 0.0
+        self._space_released = False
         BRUSH_SIZE_OVERLAY_ACTIVE = True
         if context.area:
             context.area.tag_redraw()
@@ -869,8 +870,15 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
         if not is_zbrush_sculpt_mode(context):
             return self._finish(context, cancel=True)
 
-        if event.type in {"ESC", "SPACE"} and event.value == "PRESS":
+        if event.type == "ESC" and event.value == "PRESS":
             return self._finish(context)
+
+        if event.type == "SPACE":
+            if event.value == "RELEASE":
+                self._space_released = True
+            elif event.value == "PRESS" and self._space_released and not self._left_mouse_down:
+                return self._finish(context)
+            return {"RUNNING_MODAL"}
 
         if event.type == "LEFTMOUSE":
             if event.value == "PRESS":
@@ -926,7 +934,9 @@ class ZBNAV_OT_space_brush_size_direct(ZBNAV_BrushSizeMixin, bpy.types.Operator)
     def modal(self, context, event):
         if not is_zbrush_sculpt_mode(context):
             return {"CANCELLED"}
-        if event.type in {"LEFTMOUSE", "SPACE"} and event.value == "RELEASE":
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            return {"FINISHED"}
+        if event.type == "ESC" and event.value == "PRESS":
             return {"FINISHED"}
         if event.type == "MOUSEMOVE":
             self._apply_brush_size(context, event)
