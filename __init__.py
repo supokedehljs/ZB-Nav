@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 10, 0),
+    "version": (1, 9, 5),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -17,11 +17,6 @@ from bpy.props import EnumProperty, FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
-try:
-    import ctypes
-except ImportError:
-    ctypes = None
-
 ADDON_KEYMAPS = []
 SCULPT_BRUSH_MODIFIERS = []
 SCULPT_ALT_LEFT_CONFLICTS = []
@@ -33,9 +28,6 @@ VIEW3D_DRAW_HANDLER = None
 BRUSH_SIZE_OVERLAY_HANDLER = None
 BRUSH_SIZE_OVERLAY_ACTIVE = False
 MAX_BRUSH_SIZE = 5000
-CAPS_LOCK_TIMER = None
-CAPS_LOCK_PREV = None
-VK_CAPITAL = 0x14
 BRUSH_SIZE_METHOD_PROP = "zb_nav_brush_size_method"
 BRUSH_SIZE_METHODS = {
     "TAP": "点按空格进入，左键拖动调整（类似 F）",
@@ -94,30 +86,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "space_type": "EMPTY",
         "idname": "zb_nav.space_brush_size",
         "type": "SPACE",
-        "value": "PRESS",
-        "properties": {},
-    },
-    {
-        "keymap": "3D View",
-        "space_type": "VIEW_3D",
-        "idname": "view3d.view_selected",
-        "type": "F",
-        "value": "PRESS",
-        "properties": {},
-    },
-    {
-        "keymap": "3D View",
-        "space_type": "VIEW_3D",
-        "idname": "transform.translate",
-        "type": "W",
-        "value": "PRESS",
-        "properties": {},
-    },
-    {
-        "keymap": "3D View",
-        "space_type": "VIEW_3D",
-        "idname": "view3d.localview",
-        "type": "BACK_SLASH",
         "value": "PRESS",
         "properties": {},
     },
@@ -482,11 +450,10 @@ def add_zbrush_keymaps():
 
 
 def update_navigation_mode(context, mode):
-    global BRUSH_SIZE_OVERLAY_ACTIVE, CAPS_LOCK_PREV
+    global BRUSH_SIZE_OVERLAY_ACTIVE
     if mode == "ZBRUSH":
         if context.mode != "SCULPT":
             return False
-        CAPS_LOCK_PREV = None
         add_zbrush_keymaps()
     else:
         BRUSH_SIZE_OVERLAY_ACTIVE = False
@@ -497,48 +464,6 @@ def update_navigation_mode(context, mode):
     set_nav_mode(context, mode)
     tag_all_view3d_areas_for_redraw()
     return True
-
-
-def poll_caps_lock_solo():
-    global CAPS_LOCK_PREV
-    if ctypes is None:
-        return None
-    try:
-        state = ctypes.windll.user32.GetKeyState(VK_CAPITAL) & 1
-    except Exception:
-        return 0.25
-
-    if CAPS_LOCK_PREV is None:
-        CAPS_LOCK_PREV = state
-        return 0.1
-    if state != CAPS_LOCK_PREV:
-        CAPS_LOCK_PREV = state
-        if get_nav_mode(bpy.context) == "ZBRUSH":
-            try:
-                bpy.ops.view3d.localview()
-            except Exception:
-                pass
-    return 0.1
-
-
-def start_caps_lock_timer():
-    global CAPS_LOCK_TIMER
-    if CAPS_LOCK_TIMER is not None:
-        return
-    if not bpy.app.timers.is_registered(poll_caps_lock_solo):
-        bpy.app.timers.register(poll_caps_lock_solo, persistent=True)
-    CAPS_LOCK_TIMER = poll_caps_lock_solo
-
-
-def stop_caps_lock_timer():
-    global CAPS_LOCK_TIMER
-    if CAPS_LOCK_TIMER is not None:
-        try:
-            if bpy.app.timers.is_registered(CAPS_LOCK_TIMER):
-                bpy.app.timers.unregister(CAPS_LOCK_TIMER)
-        except Exception:
-            pass
-        CAPS_LOCK_TIMER = None
 
 
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
@@ -800,13 +725,6 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             if brush_owner is not context.tool_settings.sculpt.brush:
                 brush_box.label(text="正在使用统一笔刷大小", icon="INFO")
 
-        layout.separator()
-        shortcuts_box = layout.box()
-        shortcuts_box.label(text="ZBrush 快捷键", icon="KEYINGSET")
-        shortcuts_box.label(text="F  = 查看所选", icon="VIEWZOOM")
-        shortcuts_box.label(text="W  = 变换 / 移动对象", icon="ORIENTATION_GLOBAL")
-        shortcuts_box.label(text="Caps Lock  = 单独显示（SOLO）", icon="HIDE_OFF")
-        shortcuts_box.label(text="\\  = 单独显示（备用键）", icon="HIDE_OFF")
         layout.separator()
         layout.label(text="快捷方式：Alt + 左键点击模型")
         layout.label(text="若快捷键冲突，请使用上方选择框", icon="INFO")
@@ -1284,13 +1202,11 @@ def register():
     )
     register_view3d_header_buttons()
     register_view3d_draw_handler()
-    start_caps_lock_timer()
     set_nav_mode(bpy.context, "BLENDER")
     tag_all_view3d_areas_for_redraw()
 
 
 def unregister():
-    stop_caps_lock_timer()
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
     restore_view_rotate_axis_snap()
