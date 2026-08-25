@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 1),
+    "version": (1, 9, 2),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -113,7 +113,9 @@ def get_brush_size_owner(context):
     if not brush:
         return None, None
 
-    unified = getattr(context.tool_settings, "unified_paint_settings", None)
+    unified = getattr(sculpt, "unified_paint_settings", None)
+    if unified is None:
+        unified = getattr(context.tool_settings, "unified_paint_settings", None)
     if unified is not None and getattr(unified, "use_unified_size", False):
         if hasattr(unified, "size"):
             return unified, "size"
@@ -702,10 +704,11 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             )
         )
         brush_box.label(text="点按空格进入，左键拖动调整（类似 F）", icon="MOUSE_LMB")
-        sculpt = context.tool_settings.sculpt
-        brush = sculpt.brush if sculpt else None
-        if brush and hasattr(brush, "size"):
-            brush_box.prop(brush, "size", text="当前笔刷大小")
+        brush_owner, size_property = get_brush_size_owner(context)
+        if brush_owner is not None:
+            brush_box.prop(brush_owner, size_property, text="当前笔刷大小")
+            if brush_owner is not context.tool_settings.sculpt.brush:
+                brush_box.label(text="正在使用统一笔刷大小", icon="INFO")
 
         layout.separator()
         layout.label(text="快捷方式：Alt + 左键点击模型")
