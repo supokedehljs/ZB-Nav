@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 2),
+    "version": (1, 9, 3),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -491,10 +491,22 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
+    brush_size_sensitivity: FloatProperty(
+        name="Brush Size Sensitivity",
+        description="空格拖拽调整笔刷大小时的灵敏度倍数（越大拖得越快）",
+        default=2.0,
+        min=0.1,
+        max=10.0,
+        soft_min=0.5,
+        soft_max=5.0,
+        step=10,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "pan_sensitivity")
         layout.prop(self, "zoom_sensitivity")
+        layout.prop(self, "brush_size_sensitivity")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -704,6 +716,9 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             )
         )
         brush_box.label(text="点按空格进入，左键拖动调整（类似 F）", icon="MOUSE_LMB")
+        prefs = get_preferences(context)
+        if prefs:
+            brush_box.prop(prefs, "brush_size_sensitivity", text="拖动灵敏度")
         brush_owner, size_property = get_brush_size_owner(context)
         if brush_owner is not None:
             brush_box.prop(brush_owner, size_property, text="当前笔刷大小")
@@ -789,21 +804,32 @@ class ZBNAV_BrushSizeMixin:
     _left_mouse_down = False
     _moved = False
     _adjusted = False
+    _size_accumulator = 0.0
 
     def _apply_brush_size(self, context, event):
         brush_owner, size_property = get_brush_size_owner(context)
         if brush_owner is None:
             return True
+
+        raw_delta = event.mouse_x - self._last_mouse_x
+        self._last_mouse_x = event.mouse_x
+
+        prefs = get_preferences(context)
+        sensitivity = prefs.brush_size_sensitivity if prefs else 2.0
+        self._size_accumulator += raw_delta * sensitivity
+        step = int(self._size_accumulator)
+        if step == 0:
+            return True
+        self._size_accumulator -= step
+
         current_size = int(getattr(brush_owner, size_property))
-        delta = int(event.mouse_x - self._last_mouse_x)
-        new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
+        new_size = max(1, min(current_size + step, MAX_BRUSH_SIZE))
         try:
             setattr(brush_owner, size_property, new_size)
         except (TypeError, ValueError):
             return False
         if context.area:
             context.area.tag_redraw()
-        self._last_mouse_x = event.mouse_x
         return True
 
 
@@ -811,7 +837,7 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
     bl_idname = "zb_nav.space_brush_size"
     bl_label = "Adjust Sculpt Brush Size"
     bl_description = "点按空格进入，然后按住左键水平拖动调整雕刻笔刷大小（类似 F）"
-    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
+    bl_options = {"INTERNAL", "BLOCKING"}
 
     @classmethod
     def poll(cls, context):
@@ -825,6 +851,7 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
         self._left_mouse_down = False
         self._moved = False
         self._adjusted = False
+        self._size_accumulator = 0.0
         BRUSH_SIZE_OVERLAY_ACTIVE = True
         if context.area:
             context.area.tag_redraw()
@@ -851,6 +878,8 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
                 self._start_mouse_x = event.mouse_x
                 self._start_mouse_y = event.mouse_y
                 self._moved = False
+                self._last_mouse_x = event.mouse_x
+                self._size_accumulator = 0.0
                 return {"RUNNING_MODAL"}
             if event.value == "RELEASE":
                 was_down = self._left_mouse_down
@@ -881,7 +910,7 @@ class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
 class ZBNAV_OT_space_brush_size_direct(ZBNAV_BrushSizeMixin, bpy.types.Operator):
     bl_idname = "zb_nav.space_brush_size_direct"
     bl_label = "Adjust Sculpt Brush Size (Direct Chord)"
-    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
+    bl_options = {"INTERNAL", "BLOCKING"}
 
     @classmethod
     def poll(cls, context):
@@ -890,6 +919,7 @@ class ZBNAV_OT_space_brush_size_direct(ZBNAV_BrushSizeMixin, bpy.types.Operator)
     def invoke(self, context, event):
         self._last_mouse_x = event.mouse_x
         self._left_mouse_down = True
+        self._size_accumulator = 0.0
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
