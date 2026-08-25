@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 5, 1),
+    "version": (1, 9, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -10,18 +10,30 @@ bl_info = {
 
 import math
 
+import blf
 import bpy
 import gpu
-from bpy.props import FloatProperty, PointerProperty
+from bpy.props import EnumProperty, FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
 ADDON_KEYMAPS = []
 SCULPT_BRUSH_MODIFIERS = []
 SCULPT_ALT_LEFT_CONFLICTS = []
+VIEW_ROTATE_SNAP_KEYMAPS = []
+SPACE_KEYMAP_CONFLICTS = []
 NAV_MODE_PROP = "zb_nav_mode"
 HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 VIEW3D_DRAW_HANDLER = None
+BRUSH_SIZE_OVERLAY_HANDLER = None
+BRUSH_SIZE_OVERLAY_ACTIVE = False
+MAX_BRUSH_SIZE = 5000
+BRUSH_SIZE_METHOD_PROP = "zb_nav_brush_size_method"
+BRUSH_SIZE_METHODS = {
+    "TAP": "点按空格进入，左键拖动调整（类似 F）",
+    "RADIAL": "Space + 左键直接拖动",
+    "DIRECT": "Space + 左键按下拖动",
+}
 
 ZBRUSH_KEYMAP_ITEMS = [
     {
@@ -64,7 +76,7 @@ ZBRUSH_KEYMAP_ITEMS = [
     {
         "keymap": "3D View",
         "space_type": "VIEW_3D",
-        "idname": "zb_nav.block_space",
+        "idname": "zb_nav.space_brush_size",
         "type": "SPACE",
         "value": "PRESS",
         "properties": {},
@@ -72,7 +84,7 @@ ZBRUSH_KEYMAP_ITEMS = [
     {
         "keymap": "Sculpt",
         "space_type": "EMPTY",
-        "idname": "zb_nav.block_space",
+        "idname": "zb_nav.space_brush_size",
         "type": "SPACE",
         "value": "PRESS",
         "properties": {},
@@ -89,6 +101,31 @@ def get_preferences(context):
 
 def get_nav_mode(context):
     return context.window_manager.get(NAV_MODE_PROP, "BLENDER")
+
+
+def get_brush_size_method(context):
+    return getattr(context.window_manager, BRUSH_SIZE_METHOD_PROP, "TAP")
+
+
+def get_brush_size_owner(context):
+    sculpt = context.tool_settings.sculpt
+    brush = sculpt.brush if sculpt else None
+    if not brush:
+        return None, None
+
+    unified = getattr(context.tool_settings, "unified_paint_settings", None)
+    if unified is not None and getattr(unified, "use_unified_size", False):
+        if hasattr(unified, "size"):
+            return unified, "size"
+    if hasattr(brush, "size"):
+        return brush, "size"
+    return None, None
+
+
+def update_brush_size_method(self, context):
+    if is_zbrush_sculpt_mode(context):
+        add_zbrush_keymaps()
+        tag_all_view3d_areas_for_redraw()
 
 
 def set_nav_mode(context, mode):
@@ -190,6 +227,85 @@ def restore_sculpt_brush_modifiers():
     SCULPT_ALT_LEFT_CONFLICTS.clear()
 
 
+def suspend_plain_space_keymaps():
+    restore_plain_space_keymaps()
+    wm = bpy.context.window_manager
+    keyconfig = wm.keyconfigs.user
+    if not keyconfig:
+        return
+
+    for keymap in keyconfig.keymaps:
+        for keymap_item in keymap.keymap_items:
+            if keymap_item.type != "SPACE" or not keymap_item.active:
+                continue
+            if keymap_item.ctrl or keymap_item.shift or keymap_item.alt or keymap_item.oskey:
+                continue
+            if keymap_item.key_modifier != "NONE":
+                continue
+            try:
+                SPACE_KEYMAP_CONFLICTS.append((keymap_item, keymap_item.active))
+                keymap_item.active = False
+            except (AttributeError, ReferenceError, RuntimeError):
+                continue
+
+
+def restore_plain_space_keymaps():
+    saved_keymaps = list(SPACE_KEYMAP_CONFLICTS)
+    SPACE_KEYMAP_CONFLICTS.clear()
+    for keymap_item, active in saved_keymaps:
+        try:
+            keymap_item.active = active
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def remap_view_rotate_axis_snap():
+    restore_view_rotate_axis_snap()
+    wm = bpy.context.window_manager
+
+    for keyconfig in (wm.keyconfigs.user, wm.keyconfigs.default):
+        if not keyconfig:
+            continue
+        modal_keymap = keyconfig.keymaps.get("View3D Rotate Modal")
+        if not modal_keymap:
+            continue
+
+        for keymap_item in modal_keymap.keymap_items:
+            if not keymap_item.propvalue.startswith("AXIS_SNAP"):
+                continue
+            original_state = (
+                keymap_item,
+                keymap_item.type,
+                keymap_item.value,
+                keymap_item.alt,
+                keymap_item.shift,
+                keymap_item.ctrl,
+            )
+            try:
+                keymap_item.type = "LEFT_SHIFT"
+                keymap_item.alt = False
+                keymap_item.shift = False
+                keymap_item.ctrl = False
+            except (AttributeError, ReferenceError, RuntimeError):
+                continue
+            VIEW_ROTATE_SNAP_KEYMAPS.append(original_state)
+
+
+def restore_view_rotate_axis_snap():
+    saved_keymaps = list(VIEW_ROTATE_SNAP_KEYMAPS)
+    VIEW_ROTATE_SNAP_KEYMAPS.clear()
+    for keymap_item, event_type, value, alt, shift, ctrl in saved_keymaps:
+        try:
+            keymap_item.type = event_type
+            keymap_item.value = value
+            keymap_item.alt = alt
+            keymap_item.shift = shift
+            keymap_item.ctrl = ctrl
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            # KeyMapItems can become invalid when Blender rebuilds a keymap.
+            pass
+
+
 def find_object_under_mouse(context, mouse_x, mouse_y):
     region = context.region
     region_3d = context.region_data
@@ -268,18 +384,50 @@ def select_or_invert_sculpt_target(context, event):
 def add_zbrush_keymaps():
     remove_zbrush_keymaps()
     swap_sculpt_brush_modifiers()
+    remap_view_rotate_axis_snap()
+    suspend_plain_space_keymaps()
 
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if not kc:
         return
 
-    for item in ZBRUSH_KEYMAP_ITEMS:
+    keymap_items = [
+        item for item in ZBRUSH_KEYMAP_ITEMS
+        if item["idname"] != "zb_nav.space_brush_size"
+    ]
+    if get_brush_size_method(bpy.context) == "RADIAL":
+        keymap_items.append({
+            "keymap": "Sculpt",
+            "space_type": "EMPTY",
+            "idname": "zb_nav.space_brush_size_direct",
+            "type": "LEFTMOUSE",
+            "value": "CLICK_DRAG",
+            "key_modifier": "SPACE",
+            "properties": {},
+        })
+    elif get_brush_size_method(bpy.context) == "DIRECT":
+        keymap_items.append({
+            "keymap": "Sculpt",
+            "space_type": "EMPTY",
+            "idname": "zb_nav.space_brush_size_direct",
+            "type": "LEFTMOUSE",
+            "value": "PRESS",
+            "key_modifier": "SPACE",
+            "properties": {},
+        })
+    else:
+        # TAP: F-like mode bound to a single Space press.
+        keymap_items.extend(
+            item for item in ZBRUSH_KEYMAP_ITEMS
+            if item["idname"] == "zb_nav.space_brush_size"
+        )
+
+    for item in keymap_items:
         km = kc.keymaps.new(
             name=item.get("keymap", "3D View"),
             space_type=item.get("space_type", "EMPTY"),
         )
-        props = item.get("properties", {})
         kmi = km.keymap_items.new(
             item["idname"],
             type=item["type"],
@@ -288,20 +436,29 @@ def add_zbrush_keymaps():
             ctrl=item.get("ctrl", False),
             shift=item.get("shift", False),
             oskey=item.get("oskey", False),
+            key_modifier=item.get("key_modifier", "NONE"),
         )
-        for prop_name, prop_value in props.items():
-            setattr(kmi.properties, prop_name, prop_value)
+        for prop_name, prop_value in item.get("properties", {}).items():
+            try:
+                setattr(kmi.properties, prop_name, prop_value)
+            except (AttributeError, TypeError, ValueError):
+                # Radial-control properties differ between Blender versions.
+                pass
         ADDON_KEYMAPS.append((km, kmi))
 
 
 def update_navigation_mode(context, mode):
+    global BRUSH_SIZE_OVERLAY_ACTIVE
     if mode == "ZBRUSH":
         if context.mode != "SCULPT":
             return False
         add_zbrush_keymaps()
     else:
+        BRUSH_SIZE_OVERLAY_ACTIVE = False
         remove_zbrush_keymaps()
         restore_sculpt_brush_modifiers()
+        restore_view_rotate_axis_snap()
+        restore_plain_space_keymaps()
     set_nav_mode(context, mode)
     tag_all_view3d_areas_for_redraw()
     return True
@@ -531,14 +688,87 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         )
 
         layout.separator()
+        brush_box = layout.box()
+        brush_box.label(text="笔刷大小快捷键", icon="BRUSH_DATA")
+        brush_box.prop(
+            context.window_manager,
+            BRUSH_SIZE_METHOD_PROP,
+            text="实现方案",
+        )
+        brush_box.label(
+            text=BRUSH_SIZE_METHODS.get(
+                get_brush_size_method(context),
+                get_brush_size_method(context),
+            )
+        )
+        brush_box.label(text="点按空格进入，左键拖动调整（类似 F）", icon="MOUSE_LMB")
+        sculpt = context.tool_settings.sculpt
+        brush = sculpt.brush if sculpt else None
+        if brush and hasattr(brush, "size"):
+            brush_box.prop(brush, "size", text="当前笔刷大小")
+
+        layout.separator()
         layout.label(text="快捷方式：Alt + 左键点击模型")
         layout.label(text="若快捷键冲突，请使用上方选择框", icon="INFO")
 
 
-class ZBNAV_OT_block_space(bpy.types.Operator):
-    bl_idname = "zb_nav.block_space"
-    bl_label = "Block Spacebar"
-    bl_description = "在 ZBrush 雕刻子模式中拦截空格键"
+class ZBNAV_OT_space_radial_gate(bpy.types.Operator):
+    bl_idname = "zb_nav.space_radial_gate"
+    bl_label = "ZBrush Space Brush Size"
+    bl_description = "按住空格，再按住左键水平拖动调整笔刷大小"
+    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
+
+    _left_mouse_down = False
+    _last_mouse_x = 0
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context)
+
+    def invoke(self, context, event):
+        self._left_mouse_down = False
+        self._last_mouse_x = event.mouse_x
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if not is_zbrush_sculpt_mode(context):
+            return {"CANCELLED"}
+
+        if event.type == "LEFTMOUSE":
+            if event.value == "PRESS":
+                self._left_mouse_down = True
+                self._last_mouse_x = event.mouse_x
+                return {"RUNNING_MODAL"}
+            if event.value == "RELEASE":
+                return {"FINISHED"}
+
+        if event.type == "MOUSEMOVE" and self._left_mouse_down:
+            brush_owner, size_property = get_brush_size_owner(context)
+            if brush_owner is not None:
+                current_size = int(getattr(brush_owner, size_property))
+                delta = int(event.mouse_x - self._last_mouse_x)
+                new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
+                try:
+                    setattr(brush_owner, size_property, new_size)
+                except (AttributeError, TypeError, ValueError):
+                    self.report({"WARNING"}, "当前雕刻笔刷大小不可调整")
+                    return {"CANCELLED"}
+                if context.area:
+                    context.area.tag_redraw()
+            self._last_mouse_x = event.mouse_x
+            return {"RUNNING_MODAL"}
+
+        if event.type == "SPACE" and event.value == "RELEASE":
+            return {"FINISHED"}
+
+        return {"RUNNING_MODAL"}
+
+
+class ZBNAV_OT_space_guard(bpy.types.Operator):
+    bl_idname = "zb_nav.space_guard"
+    bl_label = "ZBrush Space Guard"
+    bl_description = "ZBrush 子模式中屏蔽单独空格，同时保留空格作为组合修饰键"
     bl_options = {"INTERNAL"}
 
     @classmethod
@@ -547,6 +777,123 @@ class ZBNAV_OT_block_space(bpy.types.Operator):
 
     def execute(self, context):
         return {"FINISHED"}
+
+
+class ZBNAV_OT_space_brush_size(bpy.types.Operator):
+    bl_idname = "zb_nav.space_brush_size"
+    bl_label = "Adjust Sculpt Brush Size"
+    bl_description = "点按空格进入，然后按住左键水平拖动调整雕刻笔刷大小（类似 F）"
+    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
+
+    _last_mouse_x = 0
+    _start_mouse_x = 0
+    _start_mouse_y = 0
+    _left_mouse_down = False
+    _moved = False
+    _adjusted = False
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context)
+
+    def invoke(self, context, event):
+        global BRUSH_SIZE_OVERLAY_ACTIVE
+        self._last_mouse_x = event.mouse_x
+        self._start_mouse_x = event.mouse_x
+        self._start_mouse_y = event.mouse_y
+        self._left_mouse_down = False
+        self._moved = False
+        self._adjusted = False
+        BRUSH_SIZE_OVERLAY_ACTIVE = True
+        if context.area:
+            context.area.tag_redraw()
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context, cancel=False):
+        global BRUSH_SIZE_OVERLAY_ACTIVE
+        BRUSH_SIZE_OVERLAY_ACTIVE = False
+        if context.area:
+            context.area.tag_redraw()
+        return {"CANCELLED"} if cancel else {"FINISHED"}
+
+    def modal(self, context, event):
+        if not is_zbrush_sculpt_mode(context):
+            return self._finish(context, cancel=True)
+
+        if event.type in {"ESC", "SPACE"} and event.value == "PRESS":
+            return self._finish(context)
+
+        if event.type == "LEFTMOUSE":
+            if event.value == "PRESS":
+                self._left_mouse_down = True
+                self._start_mouse_x = event.mouse_x
+                self._start_mouse_y = event.mouse_y
+                self._moved = False
+                return {"RUNNING_MODAL"}
+            if event.value == "RELEASE":
+                was_down = self._left_mouse_down
+                self._left_mouse_down = False
+                if was_down and not self._moved and self._adjusted:
+                    return self._finish(context)
+                self._last_mouse_x = event.mouse_x
+                return {"RUNNING_MODAL"}
+
+        if event.type == "MOUSEMOVE":
+            if self._left_mouse_down:
+                if (
+                    abs(event.mouse_x - self._start_mouse_x)
+                    + abs(event.mouse_y - self._start_mouse_y)
+                ) > 3:
+                    self._moved = True
+                if self._moved:
+                    brush_owner, size_property = get_brush_size_owner(context)
+                    if brush_owner is not None:
+                        current_size = int(getattr(brush_owner, size_property))
+                        delta = int(event.mouse_x - self._last_mouse_x)
+                        new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
+                        try:
+                            setattr(brush_owner, size_property, new_size)
+                        except (TypeError, ValueError):
+                            self.report({"WARNING"}, "当前笔刷大小属性不支持调整")
+                            return self._finish(context, cancel=True)
+                        self._adjusted = True
+                        if context.area:
+                            context.area.tag_redraw()
+                self._last_mouse_x = event.mouse_x
+            return {"RUNNING_MODAL"}
+
+        return {"RUNNING_MODAL"}
+
+
+class ZBNAV_OT_space_brush_size_direct(ZBNAV_OT_space_brush_size):
+    bl_idname = "zb_nav.space_brush_size_direct"
+    bl_label = "Adjust Sculpt Brush Size (Direct Chord)"
+
+    def invoke(self, context, event):
+        self._last_mouse_x = event.mouse_x
+        self._left_mouse_down = True
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if not is_zbrush_sculpt_mode(context):
+            return {"CANCELLED"}
+        if event.type in {"LEFTMOUSE", "SPACE"} and event.value == "RELEASE":
+            return {"FINISHED"}
+        if event.type == "MOUSEMOVE":
+            brush_owner, size_property = get_brush_size_owner(context)
+            if brush_owner is not None:
+                current_size = int(getattr(brush_owner, size_property))
+                delta = int(event.mouse_x - self._last_mouse_x)
+                new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
+                try:
+                    setattr(brush_owner, size_property, new_size)
+                except (TypeError, ValueError):
+                    return {"CANCELLED"}
+                context.area.tag_redraw()
+            self._last_mouse_x = event.mouse_x
+        return {"RUNNING_MODAL"}
 
 
 class ZBNAV_OT_alt_select_target(bpy.types.Operator):
@@ -680,8 +1027,34 @@ def draw_zbrush_mode_border():
     gpu.state.blend_set("NONE")
 
 
+def draw_brush_size_overlay():
+    if not BRUSH_SIZE_OVERLAY_ACTIVE:
+        return
+    context = bpy.context
+    if not is_zbrush_sculpt_mode(context):
+        return
+
+    region = context.region
+    if not region or region.type != "WINDOW":
+        return
+
+    brush_owner, size_property = get_brush_size_owner(context)
+    if brush_owner is None:
+        return
+
+    value = getattr(brush_owner, size_property)
+    font_id = 0
+    blf.size(font_id, 16)
+    blf.color(font_id, 0.0, 0.95, 0.6, 1.0)
+    blf.position(font_id, 24, region.height - 28, 0)
+    blf.draw(font_id, f"Brush Size: {value}")
+    blf.position(font_id, 24, region.height - 46, 0)
+    blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
+    blf.draw(font_id, "拖动调整 · 点击 / 空格 / Esc 退出")
+
+
 def register_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER
+    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER
     if VIEW3D_DRAW_HANDLER is None:
         VIEW3D_DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
             draw_zbrush_mode_border,
@@ -689,16 +1062,29 @@ def register_view3d_draw_handler():
             "WINDOW",
             "POST_PIXEL",
         )
+    if BRUSH_SIZE_OVERLAY_HANDLER is None:
+        BRUSH_SIZE_OVERLAY_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
+            draw_brush_size_overlay,
+            (),
+            "WINDOW",
+            "POST_PIXEL",
+        )
 
 
 def unregister_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER
+    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER
     if VIEW3D_DRAW_HANDLER is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(VIEW3D_DRAW_HANDLER, "WINDOW")
         except (ReferenceError, RuntimeError, ValueError):
             pass
         VIEW3D_DRAW_HANDLER = None
+    if BRUSH_SIZE_OVERLAY_HANDLER is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(BRUSH_SIZE_OVERLAY_HANDLER, "WINDOW")
+        except (ReferenceError, RuntimeError, ValueError):
+            pass
+        BRUSH_SIZE_OVERLAY_HANDLER = None
 
 
 def draw_view3d_header_buttons(self, context):
@@ -735,7 +1121,10 @@ CLASSES = (
     ZBNAV_OT_switch_sculpt_target,
     ZBNAV_PT_sculpt_target,
     ZBNAV_OT_pan_or_zoom,
-    ZBNAV_OT_block_space,
+    ZBNAV_OT_space_guard,
+    ZBNAV_OT_space_radial_gate,
+    ZBNAV_OT_space_brush_size,
+    ZBNAV_OT_space_brush_size_direct,
     ZBNAV_OT_alt_select_target,
     ZBNAV_OT_alt_select_or_invert,
     ZBNAV_OT_set_navigation_mode,
@@ -745,6 +1134,17 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.WindowManager.zb_nav_brush_size_method = EnumProperty(
+        name="笔刷大小方案",
+        description="选择空格调整笔刷大小的实现方式",
+        items=(
+            ("TAP", "点按空格（类似 F）", "按一次空格进入模态，左键拖动调整，左键点击 / 空格 / Esc 退出"),
+            ("RADIAL", "Space + 左键直接拖动", "Space 作为 key_modifier，左键拖动时直接调整"),
+            ("DIRECT", "Space + 左键按下拖动", "Space 作为 key_modifier，左键按下时进入插件模态"),
+        ),
+        default="TAP",
+        update=update_brush_size_method,
+    )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
         description="选择要直接切换到雕刻模式的网格对象",
@@ -760,11 +1160,15 @@ def register():
 def unregister():
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
+    restore_view_rotate_axis_snap()
+    restore_plain_space_keymaps()
     unregister_view3d_draw_handler()
     if hasattr(bpy.context, "window_manager"):
         bpy.context.window_manager.pop(NAV_MODE_PROP, None)
     unregister_view3d_header_buttons()
     tag_all_view3d_areas_for_redraw()
+    if hasattr(bpy.types.WindowManager, "zb_nav_brush_size_method"):
+        del bpy.types.WindowManager.zb_nav_brush_size_method
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
     for cls in reversed(CLASSES):
