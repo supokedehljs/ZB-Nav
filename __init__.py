@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 0),
+    "version": (1, 9, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -779,18 +779,36 @@ class ZBNAV_OT_space_guard(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class ZBNAV_OT_space_brush_size(bpy.types.Operator):
-    bl_idname = "zb_nav.space_brush_size"
-    bl_label = "Adjust Sculpt Brush Size"
-    bl_description = "点按空格进入，然后按住左键水平拖动调整雕刻笔刷大小（类似 F）"
-    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
-
+class ZBNAV_BrushSizeMixin:
     _last_mouse_x = 0
     _start_mouse_x = 0
     _start_mouse_y = 0
     _left_mouse_down = False
     _moved = False
     _adjusted = False
+
+    def _apply_brush_size(self, context, event):
+        brush_owner, size_property = get_brush_size_owner(context)
+        if brush_owner is None:
+            return True
+        current_size = int(getattr(brush_owner, size_property))
+        delta = int(event.mouse_x - self._last_mouse_x)
+        new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
+        try:
+            setattr(brush_owner, size_property, new_size)
+        except (TypeError, ValueError):
+            return False
+        if context.area:
+            context.area.tag_redraw()
+        self._last_mouse_x = event.mouse_x
+        return True
+
+
+class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
+    bl_idname = "zb_nav.space_brush_size"
+    bl_label = "Adjust Sculpt Brush Size"
+    bl_description = "点按空格进入，然后按住左键水平拖动调整雕刻笔刷大小（类似 F）"
+    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
 
     @classmethod
     def poll(cls, context):
@@ -847,28 +865,24 @@ class ZBNAV_OT_space_brush_size(bpy.types.Operator):
                 ) > 3:
                     self._moved = True
                 if self._moved:
-                    brush_owner, size_property = get_brush_size_owner(context)
-                    if brush_owner is not None:
-                        current_size = int(getattr(brush_owner, size_property))
-                        delta = int(event.mouse_x - self._last_mouse_x)
-                        new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
-                        try:
-                            setattr(brush_owner, size_property, new_size)
-                        except (TypeError, ValueError):
-                            self.report({"WARNING"}, "当前笔刷大小属性不支持调整")
-                            return self._finish(context, cancel=True)
-                        self._adjusted = True
-                        if context.area:
-                            context.area.tag_redraw()
+                    if not self._apply_brush_size(context, event):
+                        self.report({"WARNING"}, "当前笔刷大小属性不支持调整")
+                        return self._finish(context, cancel=True)
+                    self._adjusted = True
                 self._last_mouse_x = event.mouse_x
             return {"RUNNING_MODAL"}
 
         return {"RUNNING_MODAL"}
 
 
-class ZBNAV_OT_space_brush_size_direct(ZBNAV_OT_space_brush_size):
+class ZBNAV_OT_space_brush_size_direct(ZBNAV_BrushSizeMixin, bpy.types.Operator):
     bl_idname = "zb_nav.space_brush_size_direct"
     bl_label = "Adjust Sculpt Brush Size (Direct Chord)"
+    bl_options = {"INTERNAL", "BLOCKING", "GRAB_CURSOR"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context)
 
     def invoke(self, context, event):
         self._last_mouse_x = event.mouse_x
@@ -882,17 +896,7 @@ class ZBNAV_OT_space_brush_size_direct(ZBNAV_OT_space_brush_size):
         if event.type in {"LEFTMOUSE", "SPACE"} and event.value == "RELEASE":
             return {"FINISHED"}
         if event.type == "MOUSEMOVE":
-            brush_owner, size_property = get_brush_size_owner(context)
-            if brush_owner is not None:
-                current_size = int(getattr(brush_owner, size_property))
-                delta = int(event.mouse_x - self._last_mouse_x)
-                new_size = max(1, min(current_size + delta, MAX_BRUSH_SIZE))
-                try:
-                    setattr(brush_owner, size_property, new_size)
-                except (TypeError, ValueError):
-                    return {"CANCELLED"}
-                context.area.tag_redraw()
-            self._last_mouse_x = event.mouse_x
+            self._apply_brush_size(context, event)
         return {"RUNNING_MODAL"}
 
 
