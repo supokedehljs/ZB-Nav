@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 12, 6),
+    "version": (1, 13, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -13,7 +13,8 @@ import math
 import blf
 import bpy
 import gpu
-from bpy.props import FloatProperty, PointerProperty
+import mathutils
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -33,6 +34,7 @@ CTRL_HIT_STATUS = "等待 Ctrl + 左键"
 CTRL_HIT_STATUS_X = 0
 CTRL_HIT_STATUS_Y = 0
 CTRL_LASSO_POINTS = []
+MOVE_MODE_HOVER = None
 MAX_BRUSH_SIZE = 5000
 
 ZBRUSH_KEYMAP_ITEMS = [
@@ -462,6 +464,263 @@ def _lasso_covers_object(context, points):
     return False
 
 
+MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
+
+
+def _gizmo_world_axes(context):
+    obj = context.active_object
+    if not obj:
+        return None, None
+    matrix = obj.matrix_world
+    origin = matrix.translation.copy()
+    axes = []
+    for i in range(3):
+        unit = mathutils.Vector((1, 0, 0) if i == 0 else (0, 1, 0) if i == 1 else (0, 0, 1))
+        axes.append((matrix.to_3x3() @ unit).normalized())
+    return origin, axes
+
+
+def _gizmo_length(context):
+    obj = context.active_object
+    corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
+    size = max(
+        (max(c[i] for c in corners) - min(c[i] for c in corners))
+        for i in range(3)
+    )
+    return max(0.25, min(10.0, size * 0.8))
+
+
+def _to_screen(context, world_pos):
+    return view3d_utils.location_3d_to_region_2d(
+        context.region,
+        context.region_data,
+        world_pos,
+    )
+
+
+def _dist_point_to_segment(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    cx, cy = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx, py - cy)
+
+
+def _move_mode_pick(context, mouse_x, mouse_y):
+    """Return (kind, axis) under the cursor or None."""
+    origin, axes = _gizmo_world_axes(context)
+    if origin is None:
+        return None
+    length = _gizmo_length(context)
+    candidates = []
+
+    for axis in range(3):
+        tip = origin + axes[axis] * length
+        mid = origin + axes[axis] * length * 0.6
+        tip_screen = _to_screen(context, tip)
+        mid_screen = _to_screen(context, mid)
+        if tip_screen:
+            d = math.hypot(mouse_x - tip_screen.x, mouse_y - tip_screen.y)
+            candidates.append((d, "move", axis))
+        if mid_screen:
+            d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
+            candidates.append((d, "scale", axis))
+
+    # rotate rings: circle in the plane perpendicular to each axis
+    radius = length * 0.7
+    steps = 24
+    for axis in range(3):
+        other1 = axes[(axis + 1) % 3]
+        other2 = axes[(axis + 2) % 3]
+        screen_points = []
+        for t in range(steps + 1):
+            ang = 2.0 * math.pi * t / steps
+            world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
+            screen = _to_screen(context, world)
+            if screen:
+                screen_points.append((screen.x, screen.y))
+        best = min(
+            _dist_point_to_segment(
+                mouse_x, mouse_y, screen_points[i][0], screen_points[i][1],
+                screen_points[(i + 1) % len(screen_points)][0],
+                screen_points[(i + 1) % len(screen_points)][1],
+            )
+            for i in range(len(screen_points))
+        )
+        candidates.append((best, "rotate", axis))
+
+    candidates.sort(key=lambda item: item[0])
+    if candidates and candidates[0][0] < 14.0:
+        return candidates[0][1], candidates[0][2]
+    return None
+
+
+class ZBNAV_OT_move_mode(bpy.types.Operator):
+    bl_idname = "zb_nav.move_mode"
+    bl_label = "Move Mode"
+    bl_description = "在物体原点显示移动/缩放/旋转轴，拖动轴控制物体变换"
+    bl_options = {"REGISTER", "BLOCKING"}
+
+    _drag_handle = None
+    _last_x = 0
+    _last_y = 0
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.mode == "SCULPT"
+            and context.area
+            and context.area.type == "VIEW_3D"
+            and context.active_object is not None
+        )
+
+    def invoke(self, context, event):
+        global MOVE_MODE_HOVER
+        obj = context.active_object
+        if not obj or obj.type != "MESH":
+            self.report({"WARNING"}, "请先选择一个网格对象")
+            return {"CANCELLED"}
+        self._drag_handle = None
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        MOVE_MODE_HOVER = None
+        try:
+            bpy.ops.ed.undo_push(message="Move Mode")
+        except (RuntimeError, TypeError):
+            pass
+        context.window_manager.modal_handler_add(self)
+        if context.area:
+            context.area.tag_redraw()
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context):
+        global MOVE_MODE_HOVER
+        MOVE_MODE_HOVER = None
+        if context.area:
+            context.area.tag_redraw()
+        return {"FINISHED"}
+
+    def _world_delta(self, context, event):
+        origin, _axes = _gizmo_world_axes(context)
+        region = context.region
+        region_3d = context.region_data
+        if not origin or not region or not region_3d:
+            return mathutils.Vector((0, 0, 0))
+        prev = view3d_utils.region_2d_to_location_3d(
+            region, region_3d, (self._last_x, self._last_y), origin
+        )
+        cur = view3d_utils.region_2d_to_location_3d(
+            region, region_3d, (event.mouse_region_x, event.mouse_region_y), origin
+        )
+        return cur - prev
+
+    def _apply(self, context, event):
+        if not self._drag_handle:
+            return
+        kind, axis = self._drag_handle
+        obj = context.active_object
+        if not obj:
+            return
+        origin, axes = _gizmo_world_axes(context)
+        if origin is None:
+            return
+        length = _gizmo_length(context)
+        axis_dir = axes[axis]
+
+        if kind == "move":
+            delta = self._world_delta(context, event)
+            amount = delta.dot(axis_dir)
+            matrix = obj.matrix_world.copy()
+            matrix.translation += axis_dir * amount
+            obj.matrix_world = matrix
+        elif kind == "scale":
+            delta = self._world_delta(context, event)
+            amount = delta.dot(axis_dir)
+            factor = 1.0 + amount / length
+            scale = obj.scale.copy()
+            scale[axis] = max(0.001, scale[axis] * factor)
+            obj.scale = scale
+        elif kind == "rotate":
+            origin_screen = _to_screen(context, origin)
+            if origin_screen:
+                prev_angle = math.atan2(
+                    self._last_y - origin_screen.y,
+                    self._last_x - origin_screen.x,
+                )
+                cur_angle = math.atan2(
+                    event.mouse_region_y - origin_screen.y,
+                    event.mouse_region_x - origin_screen.x,
+                )
+                angle = cur_angle - prev_angle
+                rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                obj.matrix_world = rotation @ obj.matrix_world
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        if context.area:
+            context.area.tag_redraw()
+
+    def modal(self, context, event):
+        global MOVE_MODE_HOVER
+        if not context.window_manager.zb_nav_move_mode_active:
+            return self._finish(context)
+        if not context.active_object:
+            return self._finish(context)
+
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            context.window_manager.zb_nav_move_mode_active = False
+            return self._finish(context)
+
+        if event.type == "MOUSEMOVE":
+            if self._drag_handle:
+                self._apply(context, event)
+            else:
+                hover = _move_mode_pick(context, event.mouse_region_x, event.mouse_region_y)
+                if hover != MOVE_MODE_HOVER:
+                    MOVE_MODE_HOVER = hover
+                    if context.area:
+                        context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        if event.type == "LEFTMOUSE":
+            if event.value == "PRESS":
+                self._drag_handle = _move_mode_pick(
+                    context, event.mouse_region_x, event.mouse_region_y
+                )
+                self._last_x = event.mouse_region_x
+                self._last_y = event.mouse_region_y
+                return {"RUNNING_MODAL"}
+            if event.value == "RELEASE":
+                self._drag_handle = None
+                return {"RUNNING_MODAL"}
+
+        return {"PASS_THROUGH"}
+
+
+class ZBNAV_OT_toggle_move_mode(bpy.types.Operator):
+    bl_idname = "zb_nav.toggle_move_mode"
+    bl_label = "Toggle Move Mode"
+    bl_description = "开启或退出移动模式（物体原点变换轴）"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "SCULPT"
+
+    def execute(self, context):
+        wm = context.window_manager
+        if wm.zb_nav_move_mode_active:
+            wm.zb_nav_move_mode_active = False
+        else:
+            wm.zb_nav_move_mode_active = True
+            try:
+                bpy.ops.zb_nav.move_mode("INVOKE_DEFAULT")
+            except (RuntimeError, TypeError):
+                wm.zb_nav_move_mode_active = False
+        tag_all_view3d_areas_for_redraw()
+        return {"FINISHED"}
+
+
 class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
     bl_idname = "zb_nav.ctrl_diagnostic_monitor"
     bl_label = "Ctrl Mask Helper"
@@ -523,6 +782,11 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         global CTRL_LASSO_POINTS
         if not is_zbrush_sculpt_mode(context):
             return self._finish(context)
+        if getattr(context.window_manager, "zb_nav_move_mode_active", False):
+            self._lasso_active = False
+            self._lasso_points = []
+            CTRL_LASSO_POINTS = []
+            return {"PASS_THROUGH"}
 
         if event.type == "ESC" and event.value == "PRESS":
             self._lasso_active = False
@@ -829,7 +1093,22 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        wm = context.window_manager
 
+        move_box = layout.box()
+        active = getattr(wm, "zb_nav_move_mode_active", False)
+        move_box.label(
+            text="移动模式（物体原点变换轴）",
+            icon="ORIENTATION_GLOBAL",
+        )
+        move_box.operator(
+            ZBNAV_OT_toggle_move_mode.bl_idname,
+            text="退出移动模式" if active else "开启移动模式",
+            depress=active,
+            icon="TRANSFORM_MOVE" if active else "TRANSFORM_MOVE",
+        )
+
+        layout.separator()
         box = layout.box()
         box.label(text="Alt + 鼠标中键  平移 / 缩放视图", icon="MOUSE_MOVE")
         box.label(text="Ctrl + 左键：模型笔刷 / 空白套索", icon="BRUSH_MASK")
@@ -1063,6 +1342,7 @@ class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
 
 def draw_zbrush_mode_border():
     context = bpy.context
+    draw_move_mode_gizmo()
     if not is_zbrush_sculpt_mode(context):
         return
 
@@ -1090,6 +1370,115 @@ def draw_zbrush_mode_border():
     gpu.state.line_width_set(1.0)
     gpu.state.blend_set("NONE")
     draw_ctrl_hit_status()
+
+
+def draw_move_mode_gizmo():
+    context = bpy.context
+    if context.mode != "SCULPT":
+        return
+    if not getattr(context.window_manager, "zb_nav_move_mode_active", False):
+        return
+    region = context.region
+    region_3d = context.region_data
+    if not region or region.type != "WINDOW" or not region_3d:
+        return
+
+    origin, axes = _gizmo_world_axes(context)
+    if origin is None:
+        return
+    length = _gizmo_length(context)
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    gpu.state.line_width_set(2.5)
+
+    for axis in range(3):
+        color = MOVE_AXIS_COLORS[axis]
+        axis_dir = axes[axis]
+        hovered = (
+            MOVE_MODE_HOVER is not None
+            and MOVE_MODE_HOVER[1] == axis
+        )
+
+        tip = _to_screen(context, origin + axis_dir * length)
+        mid = _to_screen(context, origin + axis_dir * length * 0.6)
+        origin_screen = _to_screen(context, origin)
+        if not tip or not origin_screen:
+            continue
+
+        # axis line
+        base_color = (color[0], color[1], color[2], 1.0)
+        if hovered and MOVE_MODE_HOVER[0] == "move":
+            base_color = (1.0, 1.0, 1.0, 1.0)
+        vertices = [
+            (origin_screen.x, origin_screen.y),
+            (tip.x, tip.y),
+        ]
+        batch = batch_for_shader(shader, "LINES", {"pos": vertices})
+        shader.bind()
+        shader.uniform_float("color", base_color)
+        batch.draw(shader)
+
+        # move arrowhead
+        if mid:
+            dx, dy = tip.x - mid.x, tip.y - mid.y
+            norm = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / norm, dy / norm
+            px, py = -uy, ux
+            arrow_color = (color[0], color[1], color[2], 1.0)
+            if hovered and MOVE_MODE_HOVER[0] == "move":
+                arrow_color = (1.0, 1.0, 1.0, 1.0)
+            tip_vertices = [
+                (tip.x, tip.y),
+                (tip.x - ux * 10 + px * 6, tip.y - uy * 10 + py * 6),
+                (tip.x - ux * 10 - px * 6, tip.y - uy * 10 - py * 6),
+                (tip.x, tip.y),
+            ]
+            arrow_batch = batch_for_shader(shader, "LINE_STRIP", {"pos": tip_vertices})
+            shader.bind()
+            shader.uniform_float("color", arrow_color)
+            arrow_batch.draw(shader)
+
+        # scale handle box
+        if mid:
+            scale_color = (color[0], color[1], color[2], 1.0)
+            if hovered and MOVE_MODE_HOVER[0] == "scale":
+                scale_color = (1.0, 1.0, 1.0, 1.0)
+            half = 5.0
+            box_vertices = [
+                (mid.x - half, mid.y - half), (mid.x + half, mid.y - half),
+                (mid.x + half, mid.y - half), (mid.x + half, mid.y + half),
+                (mid.x + half, mid.y + half), (mid.x - half, mid.y + half),
+                (mid.x - half, mid.y + half), (mid.x - half, mid.y - half),
+            ]
+            box_batch = batch_for_shader(shader, "LINES", {"pos": box_vertices})
+            shader.bind()
+            shader.uniform_float("color", scale_color)
+            box_batch.draw(shader)
+
+        # rotate ring (circle perpendicular to the axis)
+        radius = length * 0.7
+        other1 = axes[(axis + 1) % 3]
+        other2 = axes[(axis + 2) % 3]
+        steps = 32
+        ring_points = []
+        for t in range(steps + 1):
+            ang = 2.0 * math.pi * t / steps
+            world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
+            screen = _to_screen(context, world)
+            if screen:
+                ring_points.append((screen.x, screen.y))
+        if len(ring_points) >= 3:
+            ring_color = (color[0], color[1], color[2], 0.6)
+            if hovered and MOVE_MODE_HOVER[0] == "rotate":
+                ring_color = (1.0, 1.0, 1.0, 1.0)
+            ring_batch = batch_for_shader(shader, "LINE_STRIP", {"pos": ring_points})
+            shader.bind()
+            shader.uniform_float("color", ring_color)
+            ring_batch.draw(shader)
+
+    gpu.state.line_width_set(1.0)
+    gpu.state.blend_set("NONE")
 
 
 def draw_ctrl_hit_status():
@@ -1233,6 +1622,8 @@ CLASSES = (
     ZBNAV_OT_alt_select_target,
     ZBNAV_OT_alt_select_or_invert,
     ZBNAV_OT_ctrl_diagnostic_monitor,
+    ZBNAV_OT_move_mode,
+    ZBNAV_OT_toggle_move_mode,
     ZBNAV_OT_set_navigation_mode,
 )
 
@@ -1240,6 +1631,11 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.WindowManager.zb_nav_move_mode_active = BoolProperty(
+        name="移动模式",
+        description="在物体原点显示移动/缩放/旋转轴",
+        default=False,
+    )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
         description="选择要直接切换到雕刻模式的网格对象",
@@ -1266,5 +1662,7 @@ def unregister():
     tag_all_view3d_areas_for_redraw()
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
+    if hasattr(bpy.types.WindowManager, "zb_nav_move_mode_active"):
+        del bpy.types.WindowManager.zb_nav_move_mode_active
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
