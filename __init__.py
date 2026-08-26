@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 7),
+    "version": (1, 9, 8),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -114,10 +114,19 @@ def feature_enabled(feature_name):
     )
 
 
-def update_feature_toggles(self, context):
-    if is_zbrush_sculpt_mode(context):
-        add_zbrush_keymaps()
-        tag_all_view3d_areas_for_redraw()
+def _make_feature_update(feature_name):
+    def update(self, context):
+        if is_zbrush_sculpt_mode(context):
+            update_feature_keymaps(feature_name)
+            tag_all_view3d_areas_for_redraw()
+    return update
+
+
+def update_feature_keymaps(feature_name):
+    _remove_feature_items(feature_name)
+    if feature_enabled(feature_name):
+        _add_feature_items(feature_name)
+    _apply_side_effects()
 
 
 def get_nav_mode(context):
@@ -195,12 +204,58 @@ def remove_zbrush_keymaps():
         ADDON_KEYMAPS.clear()
         return
 
-    for km, kmi in ADDON_KEYMAPS:
+    for km, kmi, _feature in ADDON_KEYMAPS:
         try:
             km.keymap_items.remove(kmi)
         except (ReferenceError, RuntimeError):
             pass
     ADDON_KEYMAPS.clear()
+
+
+def _remove_feature_items(feature_name):
+    global ADDON_KEYMAPS
+    remaining = []
+    for km, kmi, entry_feature in ADDON_KEYMAPS:
+        if entry_feature == feature_name:
+            try:
+                km.keymap_items.remove(kmi)
+            except (ReferenceError, RuntimeError):
+                pass
+        else:
+            remaining.append((km, kmi, entry_feature))
+    ADDON_KEYMAPS = remaining
+
+
+def _add_feature_items(feature_name):
+    wm = bpy.context.window_manager
+    kc = wm.keyconfigs.addon
+    if not kc:
+        return
+
+    for item in ZBRUSH_KEYMAP_ITEMS:
+        if item.get("feature") != feature_name:
+            continue
+        km = kc.keymaps.new(
+            name=item.get("keymap", "3D View"),
+            space_type=item.get("space_type", "EMPTY"),
+        )
+        kmi = km.keymap_items.new(
+            item["idname"],
+            type=item["type"],
+            value=item["value"],
+            alt=item.get("alt", False),
+            ctrl=item.get("ctrl", False),
+            shift=item.get("shift", False),
+            oskey=item.get("oskey", False),
+            key_modifier=item.get("key_modifier", "NONE"),
+        )
+        for prop_name, prop_value in item.get("properties", {}).items():
+            try:
+                setattr(kmi.properties, prop_name, prop_value)
+            except (AttributeError, TypeError, ValueError):
+                # Radial-control properties differ between Blender versions.
+                pass
+        ADDON_KEYMAPS.append((km, kmi, feature_name))
 
 
 def swap_sculpt_brush_modifiers():
@@ -394,8 +449,7 @@ def select_or_invert_sculpt_target(context, event):
     return {"FINISHED"} if success else {"CANCELLED"}
 
 
-def add_zbrush_keymaps():
-    remove_zbrush_keymaps()
+def _apply_side_effects():
     if feature_enabled("target_switch"):
         swap_sculpt_brush_modifiers()
     else:
@@ -409,38 +463,14 @@ def add_zbrush_keymaps():
     else:
         restore_plain_space_keymaps()
 
-    wm = bpy.context.window_manager
-    kc = wm.keyconfigs.addon
-    if not kc:
-        return
 
-    keymap_items = [
-        item for item in ZBRUSH_KEYMAP_ITEMS
-        if feature_enabled(item.get("feature", ""))
-    ]
+def add_zbrush_keymaps():
+    remove_zbrush_keymaps()
+    _apply_side_effects()
 
-    for item in keymap_items:
-        km = kc.keymaps.new(
-            name=item.get("keymap", "3D View"),
-            space_type=item.get("space_type", "EMPTY"),
-        )
-        kmi = km.keymap_items.new(
-            item["idname"],
-            type=item["type"],
-            value=item["value"],
-            alt=item.get("alt", False),
-            ctrl=item.get("ctrl", False),
-            shift=item.get("shift", False),
-            oskey=item.get("oskey", False),
-            key_modifier=item.get("key_modifier", "NONE"),
-        )
-        for prop_name, prop_value in item.get("properties", {}).items():
-            try:
-                setattr(kmi.properties, prop_name, prop_value)
-            except (AttributeError, TypeError, ValueError):
-                # Radial-control properties differ between Blender versions.
-                pass
-        ADDON_KEYMAPS.append((km, kmi))
+    for feature_name, _label in ZBNAV_FEATURES:
+        if feature_enabled(feature_name):
+            _add_feature_items(feature_name)
 
 
 def update_navigation_mode(context, mode):
@@ -1040,7 +1070,10 @@ def register():
         setattr(
             bpy.types.WindowManager,
             "zb_nav_enable_" + feature_name,
-            BoolProperty(default=True, update=update_feature_toggles),
+            BoolProperty(
+                default=True,
+                update=_make_feature_update(feature_name),
+            ),
         )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
