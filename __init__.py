@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 6),
+    "version": (1, 9, 7),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -13,7 +13,7 @@ import math
 import blf
 import bpy
 import gpu
-from bpy.props import FloatProperty, PointerProperty
+from bpy.props import BoolProperty, FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -31,6 +31,7 @@ MAX_BRUSH_SIZE = 5000
 
 ZBRUSH_KEYMAP_ITEMS = [
     {
+        "feature": "pan_zoom",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.pan_or_zoom",
@@ -40,6 +41,7 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
+        "feature": "mask_correction",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.alt_select_or_invert",
@@ -50,6 +52,7 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
+        "feature": "target_switch",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.alt_select_target",
@@ -59,6 +62,7 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
+        "feature": "target_switch",
         "keymap": "Sculpt",
         "space_type": "EMPTY",
         "idname": "zb_nav.alt_select_target",
@@ -68,6 +72,7 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
+        "feature": "brush_size",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.space_brush_size",
@@ -76,6 +81,7 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
+        "feature": "brush_size",
         "keymap": "Sculpt",
         "space_type": "EMPTY",
         "idname": "zb_nav.space_brush_size",
@@ -85,12 +91,33 @@ ZBRUSH_KEYMAP_ITEMS = [
     },
 ]
 
+ZBNAV_FEATURES = (
+    ("pan_zoom", "Alt + 鼠标中键 平移/缩放视图"),
+    ("mask_correction", "Ctrl 遮罩修正"),
+    ("target_switch", "Alt + 鼠标左键 切换雕刻目标"),
+    ("brush_size", "空格 + 鼠标左键 调整笔刷大小"),
+)
+
 
 def get_preferences(context):
     addon = context.preferences.addons.get(__name__)
     if addon:
         return addon.preferences
     return None
+
+
+def feature_enabled(feature_name):
+    return getattr(
+        bpy.context.window_manager,
+        "zb_nav_enable_" + feature_name,
+        True,
+    )
+
+
+def update_feature_toggles(self, context):
+    if is_zbrush_sculpt_mode(context):
+        add_zbrush_keymaps()
+        tag_all_view3d_areas_for_redraw()
 
 
 def get_nav_mode(context):
@@ -369,16 +396,28 @@ def select_or_invert_sculpt_target(context, event):
 
 def add_zbrush_keymaps():
     remove_zbrush_keymaps()
-    swap_sculpt_brush_modifiers()
-    remap_view_rotate_axis_snap()
-    suspend_plain_space_keymaps()
+    if feature_enabled("target_switch"):
+        swap_sculpt_brush_modifiers()
+    else:
+        restore_sculpt_brush_modifiers()
+    if feature_enabled("pan_zoom"):
+        remap_view_rotate_axis_snap()
+    else:
+        restore_view_rotate_axis_snap()
+    if feature_enabled("brush_size"):
+        suspend_plain_space_keymaps()
+    else:
+        restore_plain_space_keymaps()
 
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if not kc:
         return
 
-    keymap_items = list(ZBRUSH_KEYMAP_ITEMS)
+    keymap_items = [
+        item for item in ZBRUSH_KEYMAP_ITEMS
+        if feature_enabled(item.get("feature", ""))
+    ]
 
     for item in keymap_items:
         km = kc.keymaps.new(
@@ -633,7 +672,13 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         return context.mode == "SCULPT"
 
     def draw(self, context):
-        pass
+        layout = self.layout
+        wm = context.window_manager
+
+        layout.label(text="ZBrush 功能开关", icon="PREFERENCES")
+        column = layout.column(align=True)
+        for feature_name, label in ZBNAV_FEATURES:
+            column.prop(wm, "zb_nav_enable_" + feature_name, text=label)
 
 
 class ZBNAV_BrushSizeMixin:
@@ -789,7 +834,7 @@ class ZBNAV_OT_alt_select_or_invert(bpy.types.Operator):
         return is_zbrush_sculpt_mode(context)
 
     def invoke(self, context, event):
-        if not (event.alt and event.ctrl and event.shift and event.type == "MIDDLEMOUSE"):
+        if not (event.ctrl and event.shift and event.type == "MIDDLEMOUSE"):
             return {"PASS_THROUGH"}
         self._start_mouse_x = event.mouse_region_x
         self._start_mouse_y = event.mouse_region_y
@@ -991,6 +1036,12 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    for feature_name, _label in ZBNAV_FEATURES:
+        setattr(
+            bpy.types.WindowManager,
+            "zb_nav_enable_" + feature_name,
+            BoolProperty(default=True, update=update_feature_toggles),
+        )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
         description="选择要直接切换到雕刻模式的网格对象",
@@ -1015,5 +1066,9 @@ def unregister():
     tag_all_view3d_areas_for_redraw()
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
+    for feature_name, _label in ZBNAV_FEATURES:
+        prop_name = "zb_nav_enable_" + feature_name
+        if hasattr(bpy.types.WindowManager, prop_name):
+            delattr(bpy.types.WindowManager, prop_name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
