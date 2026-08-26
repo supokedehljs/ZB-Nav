@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 13, 4),
+    "version": (1, 13, 5),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -651,6 +651,12 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
         MOVE_MODE_HOVER = None
+        self._region_bounds = (0, 0, 0, 0)
+        if context.area:
+            for region in context.area.regions:
+                if region.type == "WINDOW":
+                    self._region_bounds = (region.x, region.y, region.width, region.height)
+                    break
         try:
             bpy.ops.ed.undo_push(message="Move Mode")
         except (RuntimeError, TypeError):
@@ -660,12 +666,13 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
             context.area.tag_redraw()
         return {"RUNNING_MODAL"}
 
-    def _in_viewport(self, context):
+    def _in_viewport(self, event):
+        rx, ry, rw, rh = self._region_bounds
+        if rw == 0 or rh == 0:
+            return True
         return (
-            context.area
-            and context.area.type == "VIEW_3D"
-            and context.region
-            and context.region.type == "WINDOW"
+            rx <= event.mouse_x < rx + rw
+            and ry <= event.mouse_y < ry + rh
         )
 
     def _finish(self, context):
@@ -746,9 +753,8 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
             return self._finish(context)
 
         # Only interact while the cursor is over the 3D viewport; clicks in
-        # panels/other regions must pass through so the UI (e.g. the exit
-        # button) still works.
-        if event.type in {"MOUSEMOVE", "LEFTMOUSE"} and not self._in_viewport(context):
+        # panels/other regions must pass through so the UI still works.
+        if event.type in {"MOUSEMOVE", "LEFTMOUSE"} and not self._in_viewport(event):
             return {"PASS_THROUGH"}
 
         if event.type == "MOUSEMOVE":
