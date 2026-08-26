@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 1),
+    "version": (1, 15, 2),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -468,10 +468,14 @@ def _lasso_covers_object(context, points):
 MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 
 GIZMO_PIXEL_SIZE = 90.0
-GIZMO_SCALE_POS = 0.6
+GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
-GIZMO_MOVE_ARROW_SIZE = 18.0
-GIZMO_SCALE_BOX_HALF = 8.0
+GIZMO_VIEW_RING_RADIUS = 1.15
+GIZMO_MOVE_TRI_BASE = 0.5
+GIZMO_MOVE_TRI_HALF_WID = 14.0
+GIZMO_SCALE_RECT_LEN = 22.0
+GIZMO_SCALE_RECT_WID = 13.0
+GIZMO_RING_LINE_WIDTH = 7.0
 
 
 def _get_gizmo_matrix(context):
@@ -554,15 +558,21 @@ def _move_mode_pick(context, mouse_x, mouse_y):
 
     for axis in range(3):
         tip = origin + axes[axis] * length
+        base = origin + axes[axis] * length * GIZMO_MOVE_TRI_BASE
         mid = origin + axes[axis] * length * GIZMO_SCALE_POS
         tip_screen = _to_screen(context, tip)
+        base_screen = _to_screen(context, base)
         mid_screen = _to_screen(context, mid)
-        if tip_screen:
-            d = math.hypot(mouse_x - tip_screen.x, mouse_y - tip_screen.y)
-            candidates.append((d, "move", axis))
+        if tip_screen and base_screen:
+            d = _dist_point_to_segment(
+                mouse_x, mouse_y,
+                base_screen.x, base_screen.y,
+                tip_screen.x, tip_screen.y,
+            )
+            candidates.append((d - GIZMO_MOVE_TRI_HALF_WID, "move", axis))
         if mid_screen:
             d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
-            candidates.append((d, "scale", axis))
+            candidates.append((d - 10.0, "scale", axis))
 
         radius = length * GIZMO_RING_RADIUS
         steps = 24
@@ -585,10 +595,35 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 )
                 for i in range(len(screen_points))
             )
-            candidates.append((best, "rotate", axis))
+            candidates.append((best - 3.0, "rotate", axis))
+
+    # outer view-rotation ring (circle facing the camera)
+    region_3d = context.region_data
+    if region_3d:
+        view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+        view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+        outer_radius = length * GIZMO_VIEW_RING_RADIUS
+        screen_points = []
+        for t in range(49):
+            ang = 2.0 * math.pi * t / 48
+            world = origin + (view_right * math.cos(ang) + view_up * math.sin(ang)) * outer_radius
+            screen = _to_screen(context, world)
+            if screen:
+                screen_points.append((screen.x, screen.y))
+        if len(screen_points) >= 3:
+            best = min(
+                _dist_point_to_segment(
+                    mouse_x, mouse_y,
+                    screen_points[i][0], screen_points[i][1],
+                    screen_points[(i + 1) % len(screen_points)][0],
+                    screen_points[(i + 1) % len(screen_points)][1],
+                )
+                for i in range(len(screen_points))
+            )
+            candidates.append((best - 3.0, "view_rotate", -1))
 
     candidates.sort(key=lambda item: item[0])
-    if candidates and candidates[0][0] < 16.0:
+    if candidates and candidates[0][0] < 6.0:
         return candidates[0][1], candidates[0][2]
     return None
 
@@ -679,7 +714,8 @@ class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
 
     def draw_settings(context, layout, tool):
         layout.label(text="拖动轴：移动 / 缩放 / 旋转")
-        layout.label(text="Alt + 左键：设置原点位置与 Z 朝向")
+        layout.label(text="外圈：以当前视角为轴旋转")
+        layout.label(text="Alt + 左键：重设轴心 / 只变换轴")
 
 
 class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
@@ -812,34 +848,11 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         if origin is None:
             return
         length = _gizmo_length(context)
-        axis_dir = axes[axis]
 
-        if kind == "move":
-            delta = self._world_delta(context, event)
-            amount = delta.dot(axis_dir)
-            matrix = obj.matrix_world.copy()
-            matrix.translation += axis_dir * amount
-            obj.matrix_world = matrix
-            pivot = _get_gizmo_matrix(context)
-            if pivot is not None:
-                pivot = pivot.copy()
-                pivot.translation += axis_dir * amount
-                _set_gizmo_matrix(obj.name, pivot)
-        elif kind == "scale":
-            delta = self._world_delta(context, event)
-            amount = delta.dot(axis_dir)
-            factor = 1.0 + amount / length
-            scale = obj.scale.copy()
-            scale[axis] = max(0.001, scale[axis] * factor)
-            obj.scale = scale
-            obj_offset = obj.matrix_world.translation - origin
-            projected = obj_offset.dot(axis_dir) * (factor - 1.0)
-            matrix = obj.matrix_world.copy()
-            matrix.translation += axis_dir * projected
-            obj.matrix_world = matrix
-        elif kind == "rotate":
+        if kind == "view_rotate":
             origin_screen = _to_screen(context, origin)
-            if origin_screen:
+            region_3d = context.region_data
+            if origin_screen and region_3d:
                 prev_angle = math.atan2(
                     self._last_y - origin_screen.y,
                     self._last_x - origin_screen.x,
@@ -849,11 +862,55 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     event.mouse_region_x - origin_screen.x,
                 )
                 angle = cur_angle - prev_angle
-                rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                view_axis = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
+                rotation = mathutils.Matrix.Rotation(angle, 4, view_axis)
                 translation = mathutils.Matrix.Translation(origin)
                 obj.matrix_world = (
                     translation @ rotation @ translation.inverted() @ obj.matrix_world
                 )
+        else:
+            axis_dir = axes[axis]
+
+            if kind == "move":
+                delta = self._world_delta(context, event)
+                amount = delta.dot(axis_dir)
+                matrix = obj.matrix_world.copy()
+                matrix.translation += axis_dir * amount
+                obj.matrix_world = matrix
+                pivot = _get_gizmo_matrix(context)
+                if pivot is not None:
+                    pivot = pivot.copy()
+                    pivot.translation += axis_dir * amount
+                    _set_gizmo_matrix(obj.name, pivot)
+            elif kind == "scale":
+                delta = self._world_delta(context, event)
+                amount = delta.dot(axis_dir)
+                factor = 1.0 + amount / length
+                scale = obj.scale.copy()
+                scale[axis] = max(0.001, scale[axis] * factor)
+                obj.scale = scale
+                obj_offset = obj.matrix_world.translation - origin
+                projected = obj_offset.dot(axis_dir) * (factor - 1.0)
+                matrix = obj.matrix_world.copy()
+                matrix.translation += axis_dir * projected
+                obj.matrix_world = matrix
+            elif kind == "rotate":
+                origin_screen = _to_screen(context, origin)
+                if origin_screen:
+                    prev_angle = math.atan2(
+                        self._last_y - origin_screen.y,
+                        self._last_x - origin_screen.x,
+                    )
+                    cur_angle = math.atan2(
+                        event.mouse_region_y - origin_screen.y,
+                        event.mouse_region_x - origin_screen.x,
+                    )
+                    angle = cur_angle - prev_angle
+                    rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                    translation = mathutils.Matrix.Translation(origin)
+                    obj.matrix_world = (
+                        translation @ rotation @ translation.inverted() @ obj.matrix_world
+                    )
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
         if context.area:
@@ -869,20 +926,14 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         origin, axes = _gizmo_world_axes(context)
         if origin is None:
             return
-        axis_dir = axes[axis]
         matrix = _get_gizmo_matrix(context)
         if matrix is None:
             return
 
-        if kind == "move":
-            delta = self._world_delta(context, event)
-            amount = delta.dot(axis_dir)
-            matrix = matrix.copy()
-            matrix.translation += axis_dir * amount
-            _set_gizmo_matrix(obj.name, matrix)
-        elif kind == "rotate":
+        if kind == "view_rotate":
             origin_screen = _to_screen(context, origin)
-            if origin_screen:
+            region_3d = context.region_data
+            if origin_screen and region_3d:
                 prev_angle = math.atan2(
                     self._last_y - origin_screen.y,
                     self._last_x - origin_screen.x,
@@ -892,12 +943,39 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     event.mouse_region_x - origin_screen.x,
                 )
                 angle = cur_angle - prev_angle
-                rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                view_axis = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
+                rotation = mathutils.Matrix.Rotation(angle, 4, view_axis)
                 translation = mathutils.Matrix.Translation(origin)
                 matrix = matrix.copy()
                 matrix = translation @ rotation @ translation.inverted() @ matrix
                 _set_gizmo_matrix(obj.name, matrix)
-        # scale handle under Alt does nothing (only the pivot moves/rotates)
+        else:
+            axis_dir = axes[axis]
+
+            if kind == "move":
+                delta = self._world_delta(context, event)
+                amount = delta.dot(axis_dir)
+                matrix = matrix.copy()
+                matrix.translation += axis_dir * amount
+                _set_gizmo_matrix(obj.name, matrix)
+            elif kind == "rotate":
+                origin_screen = _to_screen(context, origin)
+                if origin_screen:
+                    prev_angle = math.atan2(
+                        self._last_y - origin_screen.y,
+                        self._last_x - origin_screen.x,
+                    )
+                    cur_angle = math.atan2(
+                        event.mouse_region_y - origin_screen.y,
+                        event.mouse_region_x - origin_screen.x,
+                    )
+                    angle = cur_angle - prev_angle
+                    rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                    translation = mathutils.Matrix.Translation(origin)
+                    matrix = matrix.copy()
+                    matrix = translation @ rotation @ translation.inverted() @ matrix
+                    _set_gizmo_matrix(obj.name, matrix)
+            # scale handle under Alt does nothing (only the pivot moves/rotates)
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
         if context.area:
@@ -1367,8 +1445,8 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         prefs = get_preferences(context)
         if prefs:
             move_box.prop(prefs, "gizmo_size", text="控制轴大小")
+        move_box.label(text="外圈环：以当前视角为轴旋转")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
-        move_box.label(text="Alt + 拖把手：只移动/旋转轴心")
 
         layout.separator()
         box = layout.box()
@@ -1631,30 +1709,32 @@ def _draw_tri_2d(shader, a, b, c, color):
     batch.draw(shader)
 
 
-def _draw_box_2d(shader, center, color, half=GIZMO_SCALE_BOX_HALF):
-    cx, cy = center
-    verts = [
-        (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
-        (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
-    ]
-    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
-
-
-def _draw_arrow_2d(shader, tip, back_dir, color):
-    dx, dy = back_dir
+def _draw_tri_along_axis(shader, apex, base, color, half_width):
+    dx = base[0] - apex[0]
+    dy = base[1] - apex[1]
     norm = math.hypot(dx, dy) or 1.0
     ux, uy = dx / norm, dy / norm
     px, py = -uy, ux
-    size = GIZMO_MOVE_ARROW_SIZE
-    _draw_tri_2d(shader,
-        (tip[0], tip[1]),
-        (tip[0] - ux * size + px * (size * 0.55), tip[1] - uy * size + py * (size * 0.55)),
-        (tip[0] - ux * size - px * (size * 0.55), tip[1] - uy * size - py * (size * 0.55)),
-        color,
-    )
+    left = (base[0] + px * half_width, base[1] + py * half_width)
+    right = (base[0] - px * half_width, base[1] - py * half_width)
+    _draw_tri_2d(shader, (apex[0], apex[1]), left, right, color)
+
+
+def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
+    dx, dy = axis_dir_screen
+    norm = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    half_a = along / 2.0
+    half_c = across / 2.0
+    corners = [
+        (center[0] - ux * half_a + px * half_c, center[1] - uy * half_a + py * half_c),
+        (center[0] + ux * half_a + px * half_c, center[1] + uy * half_a + py * half_c),
+        (center[0] + ux * half_a - px * half_c, center[1] + uy * half_a - py * half_c),
+        (center[0] - ux * half_a - px * half_c, center[1] - uy * half_a - py * half_c),
+    ]
+    _draw_tri_2d(shader, corners[0], corners[1], corners[2], color)
+    _draw_tri_2d(shader, corners[0], corners[2], corners[3], color)
 
 
 def draw_move_mode_gizmo():
@@ -1694,23 +1774,29 @@ def draw_move_mode_gizmo():
             axis_dir = axes[axis]
 
             tip_screen = _to_screen(context, origin + axis_dir * length)
+            base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
+            mid_screen = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
 
-            if tip_screen:
+            if tip_screen and origin_screen:
                 _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
-                # solid move arrow
-                _draw_arrow_2d(
+
+            if tip_screen and base_screen:
+                _draw_tri_along_axis(
                     shader,
                     (tip_screen.x, tip_screen.y),
-                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
+                    (base_screen.x, base_screen.y),
                     accent(color, "move"),
+                    GIZMO_MOVE_TRI_HALF_WID,
                 )
 
-            mid = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
-            if mid:
-                _draw_box_2d(
+            if mid_screen and tip_screen and origin_screen:
+                _draw_rect_along_axis(
                     shader,
-                    (mid.x, mid.y),
+                    (mid_screen.x, mid_screen.y),
+                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
                     accent(color, "scale"),
+                    GIZMO_SCALE_RECT_LEN,
+                    GIZMO_SCALE_RECT_WID,
                 )
 
             radius = length * GIZMO_RING_RADIUS
@@ -1728,9 +1814,33 @@ def draw_move_mode_gizmo():
                 ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
                 if hover and hover[1] == axis and hover[0] == "rotate":
                     ring_color = (1.0, 1.0, 1.0, 1.0)
+                gpu.state.line_width_set(GIZMO_RING_LINE_WIDTH)
                 _draw_polyline_2d(shader, ring_points, ring_color)
+                gpu.state.line_width_set(2.5)
         except Exception:
             pass
+
+    # outer view-rotation ring (circle facing the camera)
+    try:
+        view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+        view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+        outer_radius = length * GIZMO_VIEW_RING_RADIUS
+        outer_points = []
+        for t in range(49):
+            ang = 2.0 * math.pi * t / 48
+            world = origin + (view_right * math.cos(ang) + view_up * math.sin(ang)) * outer_radius
+            screen = _to_screen(context, world)
+            if screen:
+                outer_points.append((screen.x, screen.y))
+        if len(outer_points) >= 3:
+            outer_color = (1.0, 1.0, 1.0, 0.35)
+            if hover and hover[0] == "view_rotate":
+                outer_color = (1.0, 1.0, 1.0, 1.0)
+            gpu.state.line_width_set(GIZMO_RING_LINE_WIDTH)
+            _draw_polyline_2d(shader, outer_points, outer_color)
+            gpu.state.line_width_set(2.5)
+    except Exception:
+        pass
 
     gpu.state.line_width_set(1.0)
     gpu.state.blend_set("NONE")
