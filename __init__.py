@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 5),
+    "version": (1, 15, 6),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -905,17 +905,21 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         elif kind == "scale_all":
             origin_screen = _to_screen(context, origin)
             if origin_screen:
-                normal = mathutils.Vector((1, -1)).normalized()
+                normal = mathutils.Vector((1, 1)).normalized()
                 mouse_vec = mathutils.Vector((
                     event.mouse_region_x - origin_screen.x,
                     event.mouse_region_y - origin_screen.y,
                 ))
-                signed = mouse_vec.dot(normal)
-                factor = max(0.001, 1.0 + signed / GIZMO_PIXEL_SIZE)
+                prev_vec = mathutils.Vector((
+                    self._last_x - origin_screen.x,
+                    self._last_y - origin_screen.y,
+                ))
+                signed_delta = mouse_vec.dot(normal) - prev_vec.dot(normal)
+                factor = max(0.001, 1.0 + signed_delta / GIZMO_PIXEL_SIZE)
                 scale = obj.scale.copy()
                 scale *= factor
                 obj.scale = scale
-                obj_offset = obj.matrix_world.translation - origin
+                obj_offset = obj.location - origin
                 obj.location += obj_offset * (factor - 1.0)
         else:
             axis_dir = axes[axis]
@@ -938,7 +942,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 scale = obj.scale.copy()
                 scale[axis] = max(0.001, scale[axis] * factor)
                 obj.scale = scale
-                obj_offset = obj.matrix_world.translation - origin
+                obj_offset = obj.location - origin
                 projected = obj_offset.dot(axis_dir) * (factor - 1.0)
                 obj.location += axis_dir * projected
             elif kind == "rotate":
@@ -1925,7 +1929,7 @@ def draw_move_mode_gizmo():
 
     # center square: uniform scale (with diagonal reference line)
     try:
-        diag = mathutils.Vector((1, 1)).normalized()
+        diag = mathutils.Vector((1, -1)).normalized()
         span = GIZMO_PIXEL_SIZE * 1.25
         _draw_line_2d(shader,
             (origin_screen.x - diag.x * span, origin_screen.y - diag.y * span),
