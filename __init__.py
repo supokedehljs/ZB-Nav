@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 6),
+    "version": (1, 15, 7),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -470,14 +470,15 @@ MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
-GIZMO_VIEW_RING_RADIUS = 0.95
+GIZMO_VIEW_RING_RADIUS = 0.82
 GIZMO_MOVE_TRI_BASE = 0.72
 GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 26.0
 GIZMO_SCALE_RECT_WID = 16.0
-GIZMO_RING_LINE_WIDTH = 7.0
+GIZMO_RING_BAND_PX = 3.5
+GIZMO_RING_SEGMENTS = 96
 GIZMO_CENTER_SQUARE_HALF = 8.0
-GIZMO_CORNER_TRI_SIZE = 11.0
+GIZMO_CORNER_TRI_SIZE = 22.0
 
 
 def _get_gizmo_matrix(context):
@@ -1798,6 +1799,25 @@ def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across)
     _draw_tri_2d(shader, corners[0], corners[2], corners[3], color)
 
 
+def _draw_ring_band_2d(shader, inner_points, outer_points, color):
+    n = min(len(inner_points), len(outer_points))
+    if n < 3:
+        return
+    verts = []
+    for i in range(n):
+        j = (i + 1) % n
+        verts.append(inner_points[i])
+        verts.append(outer_points[i])
+        verts.append(outer_points[j])
+        verts.append(inner_points[i])
+        verts.append(outer_points[j])
+        verts.append(inner_points[j])
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
 def draw_move_mode_gizmo():
     context = bpy.context
     if context.mode != "SCULPT":
@@ -1863,21 +1883,23 @@ def draw_move_mode_gizmo():
             radius = length * GIZMO_RING_RADIUS
             other1 = axes[(axis + 1) % 3]
             other2 = axes[(axis + 2) % 3]
-            ring_points = []
-            for t in range(33):
-                ang = 2.0 * math.pi * t / 32
-                world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
-                screen = _to_screen(context, world)
-                if screen:
-                    ring_points.append((screen.x, screen.y))
-            if len(ring_points) >= 3:
+            band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
+            inner_points = []
+            outer_points = []
+            for t in range(GIZMO_RING_SEGMENTS + 1):
+                ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
+                dir_vec = other1 * math.cos(ang) + other2 * math.sin(ang)
+                si = _to_screen(context, origin + dir_vec * (radius - band_world))
+                so = _to_screen(context, origin + dir_vec * (radius + band_world))
+                if si and so:
+                    inner_points.append((si.x, si.y))
+                    outer_points.append((so.x, so.y))
+            if len(inner_points) >= 3:
                 ring_color = accent(color, "rotate")
                 ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
                 if hover and hover[1] == axis and hover[0] == "rotate":
                     ring_color = (1.0, 1.0, 1.0, 1.0)
-                gpu.state.line_width_set(GIZMO_RING_LINE_WIDTH)
-                _draw_polyline_2d(shader, ring_points, ring_color)
-                gpu.state.line_width_set(2.5)
+                _draw_ring_band_2d(shader, inner_points, outer_points, ring_color)
         except Exception:
             pass
 
@@ -1886,20 +1908,22 @@ def draw_move_mode_gizmo():
         view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
         view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
         outer_radius = length * GIZMO_VIEW_RING_RADIUS
+        band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
+        inner_points = []
         outer_points = []
-        for t in range(49):
-            ang = 2.0 * math.pi * t / 48
-            world = origin + (view_right * math.cos(ang) + view_up * math.sin(ang)) * outer_radius
-            screen = _to_screen(context, world)
-            if screen:
-                outer_points.append((screen.x, screen.y))
-        if len(outer_points) >= 3:
+        for t in range(GIZMO_RING_SEGMENTS + 1):
+            ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
+            dir_vec = view_right * math.cos(ang) + view_up * math.sin(ang)
+            si = _to_screen(context, origin + dir_vec * (outer_radius - band_world))
+            so = _to_screen(context, origin + dir_vec * (outer_radius + band_world))
+            if si and so:
+                inner_points.append((si.x, si.y))
+                outer_points.append((so.x, so.y))
+        if len(inner_points) >= 3:
             outer_color = (1.0, 1.0, 1.0, 0.35)
             if hover and hover[0] == "view_rotate":
                 outer_color = (1.0, 1.0, 1.0, 1.0)
-            gpu.state.line_width_set(GIZMO_RING_LINE_WIDTH)
-            _draw_polyline_2d(shader, outer_points, outer_color)
-            gpu.state.line_width_set(2.5)
+            _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
         # four corner triangles: translate in the view plane
         corner_angles = (45, 135, 225, 315)
