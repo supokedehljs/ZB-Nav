@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 14, 3),
+    "version": (1, 14, 4),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -736,6 +736,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     _last_x = 0
     _last_y = 0
     _reposition = False
+    _pivot_drag = False
     _press_point = None
 
     @classmethod
@@ -770,8 +771,33 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             context.area.tag_redraw()
         return {"RUNNING_MODAL"}
 
+    def _start_pivot_transform(self, context, event, handle):
+        global MOVE_MODE_HOVER
+        obj = context.active_object
+        if not obj or obj.type != "MESH":
+            return {"CANCELLED"}
+        self._pivot_drag = True
+        self._drag_handle = handle
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        MOVE_MODE_HOVER = handle
+        try:
+            bpy.ops.ed.undo_push(message="Move Mode Pivot")
+        except (RuntimeError, TypeError):
+            pass
+        context.window_manager.modal_handler_add(self)
+        if context.area:
+            context.area.tag_redraw()
+        return {"RUNNING_MODAL"}
+
     def invoke(self, context, event):
         if event.alt:
+            handle = _move_mode_pick(
+                context, event.mouse_region_x, event.mouse_region_y,
+                _move_gizmo_style(context),
+            )
+            if handle is not None:
+                return self._start_pivot_transform(context, event, handle)
             return self._start_reposition(context, event)
         global MOVE_MODE_HOVER
         obj = context.active_object
@@ -800,6 +826,9 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     def _finish(self, context):
         global MOVE_MODE_HOVER
         MOVE_MODE_HOVER = None
+        self._pivot_drag = False
+        self._reposition = False
+        self._drag_handle = None
         if context.area:
             context.area.tag_redraw()
         return {"FINISHED"}
@@ -876,6 +905,50 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         if context.area:
             context.area.tag_redraw()
 
+    def _apply_pivot(self, context, event):
+        if not self._drag_handle:
+            return
+        kind, axis = self._drag_handle
+        obj = context.active_object
+        if not obj:
+            return
+        origin, axes = _gizmo_world_axes(context)
+        if origin is None:
+            return
+        axis_dir = axes[axis]
+        matrix = _get_gizmo_matrix(context)
+        if matrix is None:
+            return
+
+        if kind == "move":
+            delta = self._world_delta(context, event)
+            amount = delta.dot(axis_dir)
+            matrix = matrix.copy()
+            matrix.translation += axis_dir * amount
+            _set_gizmo_matrix(obj.name, matrix)
+        elif kind == "rotate":
+            origin_screen = _to_screen(context, origin)
+            if origin_screen:
+                prev_angle = math.atan2(
+                    self._last_y - origin_screen.y,
+                    self._last_x - origin_screen.x,
+                )
+                cur_angle = math.atan2(
+                    event.mouse_region_y - origin_screen.y,
+                    event.mouse_region_x - origin_screen.x,
+                )
+                angle = cur_angle - prev_angle
+                rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
+                translation = mathutils.Matrix.Translation(origin)
+                matrix = matrix.copy()
+                matrix = translation @ rotation @ translation.inverted() @ matrix
+                _set_gizmo_matrix(obj.name, matrix)
+        # scale handle under Alt does nothing (only the pivot moves/rotates)
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        if context.area:
+            context.area.tag_redraw()
+
     def modal(self, context, event):
         global MOVE_MODE_HOVER
         if not context.active_object:
@@ -883,6 +956,16 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
             return self._finish(context)
+
+        if self._pivot_drag:
+            if event.type == "MOUSEMOVE":
+                self._apply_pivot(context, event)
+                return {"RUNNING_MODAL"}
+            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+                self._pivot_drag = False
+                self._drag_handle = None
+                return self._finish(context)
+            return {"RUNNING_MODAL"}
 
         if self._reposition:
             if event.type == "MOUSEMOVE":
@@ -1316,7 +1399,8 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         move_box = layout.box()
         move_box.label(text="移动模式（选择左侧移动工具开启）")
         move_box.prop(wm, "zb_nav_move_gizmo_style", text="轴样式")
-        move_box.label(text="Alt + 左键表面：重设轴心 / 拖动设 Z 朝向")
+        move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
+        move_box.label(text="Alt + 拖把手：只移动/旋转轴心")
 
         layout.separator()
         box = layout.box()
