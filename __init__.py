@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 13, 5),
+    "version": (1, 14, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -14,7 +14,7 @@ import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty
+from bpy.props import EnumProperty, FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -622,10 +622,36 @@ def _move_mode_pick(context, mouse_x, mouse_y, style):
     return None
 
 
-class ZBNAV_OT_move_mode(bpy.types.Operator):
-    bl_idname = "zb_nav.move_mode"
-    bl_label = "Move Mode"
+def _is_move_tool_active(context):
+    try:
+        from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
+        cls = ToolSelectPanelHelper._tool_class_from_space_type("VIEW_3D")
+        _item, tool_active, _icon = cls._tool_get_active(context, "VIEW_3D", "SCULPT")
+        return tool_active is not None and tool_active.idname == ZBNAV_MOVE_TOOL.bl_idname
+    except Exception:
+        return False
+
+
+class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "SCULPT"
+    bl_idname = "zb_nav.move_tool"
+    bl_label = "移动"
     bl_description = "在物体原点显示移动/缩放/旋转轴，拖动轴控制物体变换"
+    bl_icon = "ops.transform.translate"
+    bl_widget = None
+    bl_keymap = (
+        ("zb_nav.move_mode_drag", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+    )
+
+    def draw_settings(context, layout, tool):
+        layout.label(text="拖动轴：移动 / 缩放 / 旋转")
+
+
+class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
+    bl_idname = "zb_nav.move_mode_drag"
+    bl_label = "Move Mode Drag"
+    bl_description = "拖动变换轴控制物体移动/缩放/旋转"
     bl_options = {"REGISTER"}
 
     _drag_handle = None
@@ -636,27 +662,27 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
     def poll(cls, context):
         return (
             context.mode == "SCULPT"
+            and context.active_object is not None
             and context.area
             and context.area.type == "VIEW_3D"
-            and context.active_object is not None
         )
 
     def invoke(self, context, event):
         global MOVE_MODE_HOVER
         obj = context.active_object
         if not obj or obj.type != "MESH":
-            self.report({"WARNING"}, "请先选择一个网格对象")
             return {"CANCELLED"}
-        self._drag_handle = None
+        handle = _move_mode_pick(
+            context, event.mouse_region_x, event.mouse_region_y,
+            _move_gizmo_style(context),
+        )
+        if handle is None:
+            MOVE_MODE_HOVER = None
+            return {"CANCELLED"}
+        self._drag_handle = handle
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
-        MOVE_MODE_HOVER = None
-        self._region_bounds = (0, 0, 0, 0)
-        if context.area:
-            for region in context.area.regions:
-                if region.type == "WINDOW":
-                    self._region_bounds = (region.x, region.y, region.width, region.height)
-                    break
+        MOVE_MODE_HOVER = handle
         try:
             bpy.ops.ed.undo_push(message="Move Mode")
         except (RuntimeError, TypeError):
@@ -665,15 +691,6 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
         if context.area:
             context.area.tag_redraw()
         return {"RUNNING_MODAL"}
-
-    def _in_viewport(self, event):
-        rx, ry, rw, rh = self._region_bounds
-        if rw == 0 or rh == 0:
-            return True
-        return (
-            rx <= event.mouse_x < rx + rw
-            and ry <= event.mouse_y < ry + rh
-        )
 
     def _finish(self, context):
         global MOVE_MODE_HOVER
@@ -743,71 +760,20 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
 
     def modal(self, context, event):
         global MOVE_MODE_HOVER
-        if not context.window_manager.zb_nav_move_mode_active:
-            return self._finish(context)
         if not context.active_object:
             return self._finish(context)
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            context.window_manager.zb_nav_move_mode_active = False
             return self._finish(context)
 
-        # Only interact while the cursor is over the 3D viewport; clicks in
-        # panels/other regions must pass through so the UI still works.
-        if event.type in {"MOUSEMOVE", "LEFTMOUSE"} and not self._in_viewport(event):
-            return {"PASS_THROUGH"}
-
         if event.type == "MOUSEMOVE":
-            if self._drag_handle:
-                self._apply(context, event)
-            else:
-                hover = _move_mode_pick(
-                    context, event.mouse_region_x, event.mouse_region_y,
-                    _move_gizmo_style(context),
-                )
-                if hover != MOVE_MODE_HOVER:
-                    MOVE_MODE_HOVER = hover
-                    if context.area:
-                        context.area.tag_redraw()
+            self._apply(context, event)
             return {"RUNNING_MODAL"}
 
-        if event.type == "LEFTMOUSE":
-            if event.value == "PRESS":
-                self._drag_handle = _move_mode_pick(
-                    context, event.mouse_region_x, event.mouse_region_y,
-                    _move_gizmo_style(context),
-                )
-                self._last_x = event.mouse_region_x
-                self._last_y = event.mouse_region_y
-                return {"RUNNING_MODAL"}
-            if event.value == "RELEASE":
-                self._drag_handle = None
-                return {"RUNNING_MODAL"}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            return self._finish(context)
 
-        return {"PASS_THROUGH"}
-
-
-class ZBNAV_OT_toggle_move_mode(bpy.types.Operator):
-    bl_idname = "zb_nav.toggle_move_mode"
-    bl_label = "Toggle Move Mode"
-    bl_description = "开启或退出移动模式（物体原点变换轴）"
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT"
-
-    def execute(self, context):
-        wm = context.window_manager
-        if wm.zb_nav_move_mode_active:
-            wm.zb_nav_move_mode_active = False
-        else:
-            wm.zb_nav_move_mode_active = True
-            try:
-                bpy.ops.zb_nav.move_mode("INVOKE_DEFAULT")
-            except (RuntimeError, TypeError):
-                wm.zb_nav_move_mode_active = False
-        tag_all_view3d_areas_for_redraw()
-        return {"FINISHED"}
+        return {"RUNNING_MODAL"}
 
 
 class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
@@ -871,7 +837,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         global CTRL_LASSO_POINTS
         if not is_zbrush_sculpt_mode(context):
             return self._finish(context)
-        if getattr(context.window_manager, "zb_nav_move_mode_active", False):
+        if _is_move_tool_active(context):
             self._lasso_active = False
             self._lasso_points = []
             CTRL_LASSO_POINTS = []
@@ -1208,14 +1174,8 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         wm = context.window_manager
 
         move_box = layout.box()
-        active = getattr(wm, "zb_nav_move_mode_active", False)
-        move_box.label(text="移动模式（物体原点变换轴）")
+        move_box.label(text="移动模式（选择左侧移动工具开启）")
         move_box.prop(wm, "zb_nav_move_gizmo_style", text="轴样式")
-        move_box.operator(
-            ZBNAV_OT_toggle_move_mode.bl_idname,
-            text="退出移动模式" if active else "开启移动模式",
-            depress=active,
-        )
 
         layout.separator()
         box = layout.box()
@@ -1548,7 +1508,7 @@ def draw_move_mode_gizmo():
     context = bpy.context
     if context.mode != "SCULPT":
         return
-    if not getattr(context.window_manager, "zb_nav_move_mode_active", False):
+    if not _is_move_tool_active(context):
         return
     region = context.region
     region_3d = context.region_data
@@ -1785,8 +1745,7 @@ CLASSES = (
     ZBNAV_OT_alt_select_target,
     ZBNAV_OT_alt_select_or_invert,
     ZBNAV_OT_ctrl_diagnostic_monitor,
-    ZBNAV_OT_move_mode,
-    ZBNAV_OT_toggle_move_mode,
+    ZBNAV_OT_move_mode_drag,
     ZBNAV_OT_set_navigation_mode,
 )
 
@@ -1794,11 +1753,6 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.WindowManager.zb_nav_move_mode_active = BoolProperty(
-        name="移动模式",
-        description="在物体原点显示移动/缩放/旋转轴",
-        default=False,
-    )
     bpy.types.WindowManager.zb_nav_move_gizmo_style = EnumProperty(
         name="变换轴样式",
         description="选择移动模式中变换轴的外观",
@@ -1811,6 +1765,7 @@ def register():
         type=bpy.types.Object,
         poll=sculpt_target_poll,
     )
+    bpy.utils.register_tool(ZBNAV_MOVE_TOOL, separator=True)
     register_view3d_header_buttons()
     register_view3d_draw_handler()
     if not bpy.app.handlers.depsgraph_update_post.count(_auto_zbrush_handler):
@@ -1832,10 +1787,12 @@ def unregister():
         bpy.context.window_manager.pop(NAV_MODE_PROP, None)
     unregister_view3d_header_buttons()
     tag_all_view3d_areas_for_redraw()
+    try:
+        bpy.utils.unregister_tool(ZBNAV_MOVE_TOOL)
+    except Exception:
+        pass
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
-    if hasattr(bpy.types.WindowManager, "zb_nav_move_mode_active"):
-        del bpy.types.WindowManager.zb_nav_move_mode_active
     if hasattr(bpy.types.WindowManager, "zb_nav_move_gizmo_style"):
         del bpy.types.WindowManager.zb_nav_move_gizmo_style
     for cls in reversed(CLASSES):
