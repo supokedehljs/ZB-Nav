@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 14, 2),
+    "version": (1, 14, 3),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -889,11 +889,15 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 location, _normal, _obj = _raycast_surface(
                     context, event.mouse_region_x, event.mouse_region_y
                 )
-                if location:
+                obj = context.active_object
+                if location and obj:
                     drag = location - self._press_point
-                    _set_pivot_world_point(
-                        context, location, drag if drag.length > 1e-4 else None
-                    )
+                    if drag.length > 1e-4:
+                        matrix = _get_gizmo_matrix(context)
+                        if matrix is not None:
+                            _set_gizmo_matrix(
+                                obj.name, _matrix_z_to_direction(matrix, drag)
+                            )
                     if context.area:
                         context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
