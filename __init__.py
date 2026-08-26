@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 3),
+    "version": (1, 15, 4),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -470,12 +470,14 @@ MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
-GIZMO_VIEW_RING_RADIUS = 1.15
+GIZMO_VIEW_RING_RADIUS = 0.95
 GIZMO_MOVE_TRI_BASE = 0.72
 GIZMO_MOVE_TRI_HALF_WID = 10.0
-GIZMO_SCALE_RECT_LEN = 22.0
-GIZMO_SCALE_RECT_WID = 13.0
+GIZMO_SCALE_RECT_LEN = 26.0
+GIZMO_SCALE_RECT_WID = 16.0
 GIZMO_RING_LINE_WIDTH = 7.0
+GIZMO_CENTER_SQUARE_HALF = 8.0
+GIZMO_CORNER_TRI_SIZE = 11.0
 
 
 def _get_gizmo_matrix(context):
@@ -622,6 +624,22 @@ def _move_mode_pick(context, mouse_x, mouse_y):
             )
             candidates.append((best - 3.0, "view_rotate", -1))
 
+        # four corner triangles: translate in the view plane
+        corner_angles = (45, 135, 225, 315)
+        for corner in range(4):
+            rad = math.radians(corner_angles[corner])
+            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * outer_radius
+            screen = _to_screen(context, world)
+            if screen:
+                d = math.hypot(mouse_x - screen.x, mouse_y - screen.y)
+                candidates.append((d - 12.0, "view_move", corner))
+
+    # center square: uniform scale
+    origin_screen = _to_screen(context, origin)
+    if origin_screen:
+        d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
+        candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
+
     candidates.sort(key=lambda item: item[0])
     if candidates and candidates[0][0] < 6.0:
         return candidates[0][1], candidates[0][2]
@@ -713,8 +731,9 @@ class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
     )
 
     def draw_settings(context, layout, tool):
-        layout.label(text="拖动轴：移动 / 缩放 / 旋转")
-        layout.label(text="外圈：以当前视角为轴旋转")
+        layout.label(text="拖轴：移动 / 缩放 / 旋转")
+        layout.label(text="外圈：视图旋转 · 四角：视图平移")
+        layout.label(text="中心方块：整体缩放")
         layout.label(text="Alt + 左键：重设轴心 / 只变换轴")
 
 
@@ -868,6 +887,37 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 obj.matrix_world = (
                     translation @ rotation @ translation.inverted() @ obj.matrix_world
                 )
+        elif kind == "view_move":
+            delta = self._world_delta(context, event)
+            region_3d = context.region_data
+            if region_3d:
+                view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+                view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+                move = view_right * delta.dot(view_right) + view_up * delta.dot(view_up)
+                matrix = obj.matrix_world.copy()
+                matrix.translation += move
+                obj.matrix_world = matrix
+                pivot = _get_gizmo_matrix(context)
+                if pivot is not None:
+                    pivot = pivot.copy()
+                    pivot.translation += move
+                    _set_gizmo_matrix(obj.name, pivot)
+        elif kind == "scale_all":
+            origin_screen = _to_screen(context, origin)
+            if origin_screen:
+                prev_dist = math.hypot(
+                    self._last_x - origin_screen.x, self._last_y - origin_screen.y
+                )
+                cur_dist = math.hypot(
+                    event.mouse_region_x - origin_screen.x,
+                    event.mouse_region_y - origin_screen.y,
+                )
+                factor = max(0.001, 1.0 + (cur_dist - prev_dist) / GIZMO_PIXEL_SIZE)
+                scale_mat = mathutils.Matrix.Scale(factor, 4)
+                translation = mathutils.Matrix.Translation(origin)
+                obj.matrix_world = (
+                    translation @ scale_mat @ translation.inverted() @ obj.matrix_world
+                )
         else:
             axis_dir = axes[axis]
 
@@ -886,11 +936,14 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 delta = self._world_delta(context, event)
                 amount = delta.dot(axis_dir)
                 factor = max(0.001, 1.0 + amount / length)
-                scale_mat = mathutils.Matrix.Scale(factor, 4, axis_dir)
-                translation = mathutils.Matrix.Translation(origin)
-                obj.matrix_world = (
-                    translation @ scale_mat @ translation.inverted() @ obj.matrix_world
-                )
+                scale = obj.scale.copy()
+                scale[axis] = max(0.001, scale[axis] * factor)
+                obj.scale = scale
+                obj_offset = obj.matrix_world.translation - origin
+                projected = obj_offset.dot(axis_dir) * (factor - 1.0)
+                matrix = obj.matrix_world.copy()
+                matrix.translation += axis_dir * projected
+                obj.matrix_world = matrix
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
@@ -945,6 +998,16 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 translation = mathutils.Matrix.Translation(origin)
                 matrix = matrix.copy()
                 matrix = translation @ rotation @ translation.inverted() @ matrix
+                _set_gizmo_matrix(obj.name, matrix)
+        elif kind == "view_move":
+            delta = self._world_delta(context, event)
+            region_3d = context.region_data
+            if region_3d:
+                view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+                view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+                move = view_right * delta.dot(view_right) + view_up * delta.dot(view_up)
+                matrix = matrix.copy()
+                matrix.translation += move
                 _set_gizmo_matrix(obj.name, matrix)
         else:
             axis_dir = axes[axis]
@@ -1442,7 +1505,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         prefs = get_preferences(context)
         if prefs:
             move_box.prop(prefs, "gizmo_size", text="控制轴大小")
-        move_box.label(text="外圈环：以当前视角为轴旋转")
+        move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
 
         layout.separator()
@@ -1836,6 +1899,45 @@ def draw_move_mode_gizmo():
             gpu.state.line_width_set(GIZMO_RING_LINE_WIDTH)
             _draw_polyline_2d(shader, outer_points, outer_color)
             gpu.state.line_width_set(2.5)
+
+        # four corner triangles: translate in the view plane
+        corner_angles = (45, 135, 225, 315)
+        for corner in range(4):
+            rad = math.radians(corner_angles[corner])
+            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * outer_radius
+            screen = _to_screen(context, world)
+            if not screen:
+                continue
+            center = (screen.x, screen.y)
+            radial = (screen.x - origin_screen.x, screen.y - origin_screen.y)
+            corner_color = (1.0, 1.0, 1.0, 0.8)
+            if hover and hover[0] == "view_move" and hover[1] == corner:
+                corner_color = (1.0, 1.0, 1.0, 1.0)
+            _draw_tri_along_axis(
+                shader,
+                (center[0] + radial[0], center[1] + radial[1]),
+                center,
+                corner_color,
+                GIZMO_CORNER_TRI_SIZE,
+            )
+    except Exception:
+        pass
+
+    # center square: uniform scale
+    try:
+        center_color = (1.0, 1.0, 1.0, 0.9)
+        if hover and hover[0] == "scale_all":
+            center_color = (1.0, 1.0, 1.0, 1.0)
+        half = GIZMO_CENTER_SQUARE_HALF
+        cx, cy = origin_screen.x, origin_screen.y
+        verts = [
+            (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
+            (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
+        ]
+        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+        shader.bind()
+        shader.uniform_float("color", center_color)
+        batch.draw(shader)
     except Exception:
         pass
 
