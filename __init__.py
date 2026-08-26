@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 9),
+    "version": (1, 15, 10),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -469,12 +469,10 @@ MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
-GIZMO_RING_RADIUS = 0.7
-GIZMO_VIEW_RING_RADIUS = 0.82
 GIZMO_MOVE_TRI_BASE = 0.8
 GIZMO_MOVE_TRI_HALF_WID = 10.0
-GIZMO_SCALE_RECT_LEN = 26.0
-GIZMO_SCALE_RECT_WID = 16.0
+GIZMO_RING_RADIUS = 0.7
+GIZMO_VIEW_RING_SCALE = 1.17
 GIZMO_RING_BAND_PX = 2.0
 GIZMO_RING_SEGMENTS = 96
 GIZMO_CENTER_SQUARE_HALF = 8.0
@@ -496,6 +494,35 @@ def _get_gizmo_matrix(context):
 def _set_gizmo_matrix(obj_name, matrix):
     global MOVE_GIZMO_PIVOT
     MOVE_GIZMO_PIVOT = (obj_name, matrix.copy())
+
+
+def _gizmo_style_vals(context):
+    prefs = get_preferences(context)
+    if prefs is None:
+        return {
+            "axis_length": GIZMO_PIXEL_SIZE,
+            "axis_width": 2.5,
+            "move_tri_base": GIZMO_MOVE_TRI_BASE,
+            "move_tri_half": GIZMO_MOVE_TRI_HALF_WID,
+            "ring_radius": GIZMO_RING_RADIUS,
+            "ring_band": GIZMO_RING_BAND_PX,
+            "corner_radius": GIZMO_CORNER_RADIUS,
+            "corner_height": GIZMO_CORNER_TRI_HEIGHT,
+            "corner_width": GIZMO_CORNER_TRI_HALF_WID,
+            "center_square": GIZMO_CENTER_SQUARE_HALF,
+        }
+    return {
+        "axis_length": prefs.gizmo_axis_length,
+        "axis_width": prefs.gizmo_axis_width,
+        "move_tri_base": prefs.gizmo_move_tri_base,
+        "move_tri_half": prefs.gizmo_move_tri_half,
+        "ring_radius": prefs.gizmo_ring_radius,
+        "ring_band": prefs.gizmo_ring_band,
+        "corner_radius": prefs.gizmo_corner_radius,
+        "corner_height": prefs.gizmo_corner_height,
+        "corner_width": prefs.gizmo_corner_width,
+        "center_square": prefs.gizmo_center_square,
+    }
 
 
 def _gizmo_world_axes(context):
@@ -520,9 +547,9 @@ def _gizmo_length(context):
     if not region or not region_3d:
         return 1.0
 
-    prefs = get_preferences(context)
+    vals = _gizmo_style_vals(context)
     size = prefs.gizmo_size if prefs else 1.0
-    target_pixels = GIZMO_PIXEL_SIZE * max(0.2, size)
+    target_pixels = vals["axis_length"] * max(0.2, size)
 
     right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
     a = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
@@ -559,11 +586,12 @@ def _move_mode_pick(context, mouse_x, mouse_y):
     if origin is None:
         return None
     length = _gizmo_length(context)
+    vals = _gizmo_style_vals(context)
     candidates = []
 
     for axis in range(3):
         tip = origin + axes[axis] * length
-        base = origin + axes[axis] * length * GIZMO_MOVE_TRI_BASE
+        base = origin + axes[axis] * length * vals["move_tri_base"]
         mid = origin + axes[axis] * length * GIZMO_SCALE_POS
         tip_screen = _to_screen(context, tip)
         base_screen = _to_screen(context, base)
@@ -574,12 +602,12 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 base_screen.x, base_screen.y,
                 tip_screen.x, tip_screen.y,
             )
-            candidates.append((d - GIZMO_MOVE_TRI_HALF_WID, "move", axis))
+            candidates.append((d - vals["move_tri_half"], "move", axis))
         if mid_screen:
             d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
             candidates.append((d - 12.0, "scale", axis))
 
-        radius = length * GIZMO_RING_RADIUS
+        radius = length * vals["ring_radius"]
         steps = 24
         other1 = axes[(axis + 1) % 3]
         other2 = axes[(axis + 2) % 3]
@@ -607,7 +635,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
     if region_3d:
         view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
         view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
-        outer_radius = length * GIZMO_VIEW_RING_RADIUS
+        outer_radius = length * vals["ring_radius"] * GIZMO_VIEW_RING_SCALE
         screen_points = []
         for t in range(49):
             ang = 2.0 * math.pi * t / 48
@@ -629,7 +657,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
 
         # four corner triangles: translate in the view plane
         corner_angles = (45, 135, 225, 315)
-        corner_radius = length * GIZMO_CORNER_RADIUS
+        corner_radius = length * vals["corner_radius"]
         for corner in range(4):
             rad = math.radians(corner_angles[corner])
             world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
@@ -642,7 +670,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
     origin_screen = _to_screen(context, origin)
     if origin_screen:
         d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
-        candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
+        candidates.append((d - vals["center_square"] - 4.0, "scale_all", -1))
 
     candidates.sort(key=lambda item: item[0])
     if candidates and candidates[0][0] < 6.0:
@@ -919,7 +947,8 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     self._last_y - origin_screen.y,
                 ))
                 signed_delta = mouse_vec.dot(normal) - prev_vec.dot(normal)
-                factor = max(0.001, 1.0 + signed_delta / GIZMO_PIXEL_SIZE)
+                axis_px = _gizmo_style_vals(context)["axis_length"]
+                factor = max(0.001, 1.0 + signed_delta / axis_px)
                 scale = obj.scale.copy()
                 scale *= factor
                 obj.scale = scale
@@ -1278,6 +1307,10 @@ def _auto_zbrush_handler(scene, depsgraph):
             pass
 
 
+def _gizmo_pref_update(self, context):
+    tag_all_view3d_areas_for_redraw()
+
+
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
@@ -1323,6 +1356,98 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         soft_min=0.5,
         soft_max=2.5,
         step=10,
+        update=_gizmo_pref_update,
+    )
+
+    gizmo_axis_length: FloatProperty(
+        name="轴向长度",
+        description="3 根轴从中心到末端的屏幕长度（像素）",
+        default=GIZMO_PIXEL_SIZE,
+        min=40.0,
+        max=300.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_axis_width: FloatProperty(
+        name="移动轴粗细",
+        description="轴向线的粗细",
+        default=2.5,
+        min=1.0,
+        max=8.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_move_tri_base: FloatProperty(
+        name="移动三角位置",
+        description="移动三角形底边到中心的距离（相对轴向）",
+        default=GIZMO_MOVE_TRI_BASE,
+        min=0.3,
+        max=0.95,
+        step=5,
+        update=_gizmo_pref_update,
+    )
+    gizmo_move_tri_half: FloatProperty(
+        name="移动三角大小",
+        description="移动三角形底边半宽（像素）",
+        default=GIZMO_MOVE_TRI_HALF_WID,
+        min=4.0,
+        max=30.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_ring_radius: FloatProperty(
+        name="圆环大小",
+        description="旋转圆环的半径（相对轴向）",
+        default=GIZMO_RING_RADIUS,
+        min=0.3,
+        max=1.5,
+        step=5,
+        update=_gizmo_pref_update,
+    )
+    gizmo_ring_band: FloatProperty(
+        name="圆环宽度",
+        description="旋转圆环的带宽（像素）",
+        default=GIZMO_RING_BAND_PX,
+        min=1.0,
+        max=8.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_corner_radius: FloatProperty(
+        name="平移角远近",
+        description="4 个平移三角到中心的距离（相对轴向）",
+        default=GIZMO_CORNER_RADIUS,
+        min=0.5,
+        max=1.5,
+        step=5,
+        update=_gizmo_pref_update,
+    )
+    gizmo_corner_height: FloatProperty(
+        name="平移角高度",
+        description="4 个平移三角的高度（像素）",
+        default=GIZMO_CORNER_TRI_HEIGHT,
+        min=6.0,
+        max=60.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_corner_width: FloatProperty(
+        name="平移角宽度",
+        description="4 个平移三角的底宽（像素）",
+        default=GIZMO_CORNER_TRI_HALF_WID,
+        min=6.0,
+        max=60.0,
+        step=10,
+        update=_gizmo_pref_update,
+    )
+    gizmo_center_square: FloatProperty(
+        name="中心缩放大小",
+        description="中心整体缩放方块的半宽（像素）",
+        default=GIZMO_CENTER_SQUARE_HALF,
+        min=3.0,
+        max=30.0,
+        step=10,
+        update=_gizmo_pref_update,
     )
 
     def draw(self, context):
@@ -1331,6 +1456,18 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "zoom_sensitivity")
         layout.prop(self, "brush_size_sensitivity")
         layout.prop(self, "gizmo_size")
+        box = layout.box()
+        box.label(text="控制轴外观参数", icon="PREFERENCES")
+        box.prop(self, "gizmo_axis_length")
+        box.prop(self, "gizmo_axis_width")
+        box.prop(self, "gizmo_move_tri_base")
+        box.prop(self, "gizmo_move_tri_half")
+        box.prop(self, "gizmo_ring_radius")
+        box.prop(self, "gizmo_ring_band")
+        box.prop(self, "gizmo_corner_radius")
+        box.prop(self, "gizmo_corner_height")
+        box.prop(self, "gizmo_corner_width")
+        box.prop(self, "gizmo_center_square")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1510,6 +1647,18 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         prefs = get_preferences(context)
         if prefs:
             move_box.prop(prefs, "gizmo_size", text="控制轴大小")
+            style_box = move_box.box()
+            style_box.label(text="控制轴外观参数", icon="PREFERENCES")
+            style_box.prop(prefs, "gizmo_axis_length", text="轴向长度")
+            style_box.prop(prefs, "gizmo_axis_width", text="移动轴粗细")
+            style_box.prop(prefs, "gizmo_move_tri_base", text="移动三角位置")
+            style_box.prop(prefs, "gizmo_move_tri_half", text="移动三角大小")
+            style_box.prop(prefs, "gizmo_ring_radius", text="圆环大小")
+            style_box.prop(prefs, "gizmo_ring_band", text="圆环宽度")
+            style_box.prop(prefs, "gizmo_corner_radius", text="平移角远近")
+            style_box.prop(prefs, "gizmo_corner_height", text="平移角高度")
+            style_box.prop(prefs, "gizmo_corner_width", text="平移角宽度")
+            style_box.prop(prefs, "gizmo_center_square", text="中心缩放大小")
         move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
 
@@ -1836,10 +1985,11 @@ def draw_move_mode_gizmo():
     if origin is None:
         return
     length = _gizmo_length(context)
+    vals = _gizmo_style_vals(context)
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
-    gpu.state.line_width_set(2.5)
+    gpu.state.line_width_set(vals["axis_width"])
 
     origin_screen = _to_screen(context, origin)
     if not origin_screen:
@@ -1858,7 +2008,7 @@ def draw_move_mode_gizmo():
             axis_dir = axes[axis]
 
             tip_screen = _to_screen(context, origin + axis_dir * length)
-            base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
+            base_screen = _to_screen(context, origin + axis_dir * length * vals["move_tri_base"])
             mid_screen = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
 
             if tip_screen and origin_screen:
@@ -1870,7 +2020,7 @@ def draw_move_mode_gizmo():
                     (tip_screen.x, tip_screen.y),
                     (base_screen.x, base_screen.y),
                     accent(color, "move"),
-                    GIZMO_MOVE_TRI_HALF_WID,
+                    vals["move_tri_half"],
                 )
 
             if mid_screen and tip_screen and origin_screen:
@@ -1883,10 +2033,10 @@ def draw_move_mode_gizmo():
                     GIZMO_SCALE_RECT_WID,
                 )
 
-            radius = length * GIZMO_RING_RADIUS
+            radius = length * vals["ring_radius"]
             other1 = axes[(axis + 1) % 3]
             other2 = axes[(axis + 2) % 3]
-            band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
+            band_world = length * (vals["ring_band"] / vals["axis_length"])
             inner_points = []
             outer_points = []
             for t in range(GIZMO_RING_SEGMENTS + 1):
@@ -1910,8 +2060,8 @@ def draw_move_mode_gizmo():
     try:
         view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
         view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
-        outer_radius = length * GIZMO_VIEW_RING_RADIUS
-        band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
+        outer_radius = length * vals["ring_radius"] * GIZMO_VIEW_RING_SCALE
+        band_world = length * (vals["ring_band"] / vals["axis_length"])
         inner_points = []
         outer_points = []
         for t in range(GIZMO_RING_SEGMENTS + 1):
@@ -1930,9 +2080,9 @@ def draw_move_mode_gizmo():
 
         # four corner triangles: translate in the view plane (squat, farther out)
         corner_angles = (45, 135, 225, 315)
-        corner_radius = length * GIZMO_CORNER_RADIUS
-        tri_height = GIZMO_CORNER_TRI_HEIGHT
-        tri_half_wid = GIZMO_CORNER_TRI_HALF_WID
+        corner_radius = length * vals["corner_radius"]
+        tri_height = vals["corner_height"]
+        tri_half_wid = vals["corner_width"]
         for corner in range(4):
             rad = math.radians(corner_angles[corner])
             world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
@@ -1955,19 +2105,12 @@ def draw_move_mode_gizmo():
     except Exception:
         pass
 
-    # center square: uniform scale (with diagonal reference line)
+    # center square: uniform scale
     try:
-        diag = mathutils.Vector((1, -1)).normalized()
-        span = GIZMO_PIXEL_SIZE * 1.25
-        _draw_line_2d(shader,
-            (origin_screen.x - diag.x * span, origin_screen.y - diag.y * span),
-            (origin_screen.x + diag.x * span, origin_screen.y + diag.y * span),
-            (1.0, 1.0, 1.0, 0.15),
-        )
         center_color = (1.0, 1.0, 1.0, 0.9)
         if hover and hover[0] == "scale_all":
             center_color = (1.0, 1.0, 1.0, 1.0)
-        half = GIZMO_CENTER_SQUARE_HALF
+        half = vals["center_square"]
         cx, cy = origin_screen.x, origin_screen.y
         verts = [
             (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
