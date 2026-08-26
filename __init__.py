@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 14, 4),
+    "version": (1, 15, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -14,7 +14,7 @@ import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import EnumProperty, FloatProperty, PointerProperty
+from bpy.props import FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -467,50 +467,11 @@ def _lasso_covers_object(context, points):
 
 MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 
-ZBNAV_MOVE_GIZMO_STYLES = (
-    ("standard", "标准（箭头 + 方块 + 圆环）", "三轴带移动箭头、缩放方块和旋转圆环"),
-    ("arrows", "极简箭头（仅移动）", "简洁的三轴箭头，只用于移动"),
-    ("zbrush", "ZBrush 加粗箭头", "粗壮的填充箭头 + 方块 + 圆环"),
-    ("rings", "圆环（侧重旋转）", "粗圆环旋转 + 细线移动"),
-    ("double", "双头箭头", "双向箭头，两个方向都能拖动移动"),
-    ("dots", "圆点轴", "细线轴 + 圆点把手 + 圆环"),
-)
-
-GIZMO_STYLE_CONFIG = {
-    "standard": {
-        "line": 2.5, "arrow": "v", "scale": "box", "rotate": True,
-        "double": False, "center": "dot", "ring_radius": 0.7, "scale_pos": 0.6,
-    },
-    "arrows": {
-        "line": 2.0, "arrow": "v", "scale": None, "rotate": False,
-        "double": False, "center": None, "ring_radius": 0.7, "scale_pos": 0.6,
-    },
-    "zbrush": {
-        "line": 3.5, "arrow": "tri", "scale": "box", "rotate": True,
-        "double": False, "center": "cube", "ring_radius": 0.7, "scale_pos": 0.55,
-    },
-    "rings": {
-        "line": 1.5, "arrow": None, "scale": None, "rotate": True,
-        "double": False, "center": None, "ring_radius": 0.95,
-        "scale_pos": 0.6, "line_move": True,
-    },
-    "double": {
-        "line": 2.5, "arrow": "v", "scale": "box", "rotate": True,
-        "double": True, "center": None, "ring_radius": 0.7, "scale_pos": 0.5,
-    },
-    "dots": {
-        "line": 1.5, "arrow": "dot", "scale": "dot_box", "rotate": True,
-        "double": False, "center": "dot", "ring_radius": 0.7, "scale_pos": 0.6,
-    },
-}
-
-
-def _move_gizmo_style(context):
-    return getattr(
-        context.window_manager,
-        "zb_nav_move_gizmo_style",
-        "standard",
-    )
+GIZMO_PIXEL_SIZE = 90.0
+GIZMO_SCALE_POS = 0.6
+GIZMO_RING_RADIUS = 0.7
+GIZMO_MOVE_ARROW_SIZE = 18.0
+GIZMO_SCALE_BOX_HALF = 8.0
 
 
 def _get_gizmo_matrix(context):
@@ -541,13 +502,25 @@ def _gizmo_world_axes(context):
 
 
 def _gizmo_length(context):
-    obj = context.active_object
-    corners = [obj.matrix_world @ mathutils.Vector(c) for c in obj.bound_box]
-    size = max(
-        (max(c[i] for c in corners) - min(c[i] for c in corners))
-        for i in range(3)
+    matrix = _get_gizmo_matrix(context)
+    if matrix is None:
+        return 1.0
+    origin = matrix.translation
+    region = context.region
+    region_3d = context.region_data
+    if not region or not region_3d:
+        return 1.0
+    origin_screen = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
+    if origin_screen is None:
+        return 1.0
+    other = view3d_utils.region_2d_to_location_3d(
+        region,
+        region_3d,
+        (origin_screen.x + GIZMO_PIXEL_SIZE, origin_screen.y),
+        origin,
     )
-    return max(0.25, min(10.0, size * 0.8))
+    world_len = (other - origin).length
+    return max(world_len, 1e-4)
 
 
 def _to_screen(context, world_pos):
@@ -568,9 +541,8 @@ def _dist_point_to_segment(px, py, ax, ay, bx, by):
     return math.hypot(px - cx, py - cy)
 
 
-def _move_mode_pick(context, mouse_x, mouse_y, style):
-    """Return (kind, axis) under the cursor or None."""
-    cfg = GIZMO_STYLE_CONFIG.get(style, GIZMO_STYLE_CONFIG["standard"])
+def _move_mode_pick(context, mouse_x, mouse_y):
+    """Return (kind, axis) under the cursor or None (standard gizmo)."""
     origin, axes = _gizmo_world_axes(context)
     if origin is None:
         return None
@@ -578,61 +550,42 @@ def _move_mode_pick(context, mouse_x, mouse_y, style):
     candidates = []
 
     for axis in range(3):
-        if cfg.get("line_move"):
-            origin_screen = _to_screen(context, origin)
-            tip_screen = _to_screen(context, origin + axes[axis] * length)
-            if origin_screen and tip_screen:
-                d = _dist_point_to_segment(
+        tip = origin + axes[axis] * length
+        mid = origin + axes[axis] * length * GIZMO_SCALE_POS
+        tip_screen = _to_screen(context, tip)
+        mid_screen = _to_screen(context, mid)
+        if tip_screen:
+            d = math.hypot(mouse_x - tip_screen.x, mouse_y - tip_screen.y)
+            candidates.append((d, "move", axis))
+        if mid_screen:
+            d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
+            candidates.append((d, "scale", axis))
+
+        radius = length * GIZMO_RING_RADIUS
+        steps = 24
+        other1 = axes[(axis + 1) % 3]
+        other2 = axes[(axis + 2) % 3]
+        screen_points = []
+        for t in range(steps + 1):
+            ang = 2.0 * math.pi * t / steps
+            world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
+            screen = _to_screen(context, world)
+            if screen:
+                screen_points.append((screen.x, screen.y))
+        if len(screen_points) >= 3:
+            best = min(
+                _dist_point_to_segment(
                     mouse_x, mouse_y,
-                    origin_screen.x, origin_screen.y,
-                    tip_screen.x, tip_screen.y,
+                    screen_points[i][0], screen_points[i][1],
+                    screen_points[(i + 1) % len(screen_points)][0],
+                    screen_points[(i + 1) % len(screen_points)][1],
                 )
-                candidates.append((d, "move", axis))
-
-        if cfg["arrow"]:
-            tips = [(1.0, 1.0)]
-            if cfg["double"]:
-                tips = [(1.0, 1.0), (-1.0, 1.0)]
-            for sign, _sc in tips:
-                tip = origin + axes[axis] * length * sign
-                tip_screen = _to_screen(context, tip)
-                if tip_screen:
-                    d = math.hypot(mouse_x - tip_screen.x, mouse_y - tip_screen.y)
-                    candidates.append((d, "move", axis))
-
-        if cfg["scale"]:
-            mid = origin + axes[axis] * length * cfg["scale_pos"]
-            mid_screen = _to_screen(context, mid)
-            if mid_screen:
-                d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
-                candidates.append((d, "scale", axis))
-
-        if cfg["rotate"]:
-            radius = length * cfg["ring_radius"]
-            steps = 24
-            other1 = axes[(axis + 1) % 3]
-            other2 = axes[(axis + 2) % 3]
-            screen_points = []
-            for t in range(steps + 1):
-                ang = 2.0 * math.pi * t / steps
-                world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
-                screen = _to_screen(context, world)
-                if screen:
-                    screen_points.append((screen.x, screen.y))
-            if len(screen_points) >= 3:
-                best = min(
-                    _dist_point_to_segment(
-                        mouse_x, mouse_y,
-                        screen_points[i][0], screen_points[i][1],
-                        screen_points[(i + 1) % len(screen_points)][0],
-                        screen_points[(i + 1) % len(screen_points)][1],
-                    )
-                    for i in range(len(screen_points))
-                )
-                candidates.append((best, "rotate", axis))
+                for i in range(len(screen_points))
+            )
+            candidates.append((best, "rotate", axis))
 
     candidates.sort(key=lambda item: item[0])
-    if candidates and candidates[0][0] < 14.0:
+    if candidates and candidates[0][0] < 16.0:
         return candidates[0][1], candidates[0][2]
     return None
 
@@ -794,7 +747,6 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         if event.alt:
             handle = _move_mode_pick(
                 context, event.mouse_region_x, event.mouse_region_y,
-                _move_gizmo_style(context),
             )
             if handle is not None:
                 return self._start_pivot_transform(context, event, handle)
@@ -805,7 +757,6 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             return {"CANCELLED"}
         handle = _move_mode_pick(
             context, event.mouse_region_x, event.mouse_region_y,
-            _move_gizmo_style(context),
         )
         if handle is None:
             MOVE_MODE_HOVER = None
@@ -1398,7 +1349,6 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
 
         move_box = layout.box()
         move_box.label(text="移动模式（选择左侧移动工具开启）")
-        move_box.prop(wm, "zb_nav_move_gizmo_style", text="轴样式")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
         move_box.label(text="Alt + 拖把手：只移动/旋转轴心")
 
@@ -1663,70 +1613,30 @@ def _draw_tri_2d(shader, a, b, c, color):
     batch.draw(shader)
 
 
-def _draw_filled_circle_2d(shader, center, radius, color, segments=12):
+def _draw_box_2d(shader, center, color, half=GIZMO_SCALE_BOX_HALF):
     cx, cy = center
-    verts = []
-    for i in range(segments):
-        a1 = 2.0 * math.pi * i / segments
-        a2 = 2.0 * math.pi * (i + 1) / segments
-        verts.append((cx, cy))
-        verts.append((cx + math.cos(a1) * radius, cy + math.sin(a1) * radius))
-        verts.append((cx + math.cos(a2) * radius, cy + math.sin(a2) * radius))
-    _draw_tri_2d(shader, verts[0], verts[1], verts[2], color)
+    verts = [
+        (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
+        (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
+    ]
     batch = batch_for_shader(shader, "TRIS", {"pos": verts})
     shader.bind()
     shader.uniform_float("color", color)
     batch.draw(shader)
 
 
-def _draw_box_2d(shader, center, color, filled=False):
-    cx, cy = center
-    half = 5.0
-    if filled:
-        verts = [
-            (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
-            (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
-        ]
-        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", color)
-        batch.draw(shader)
-    else:
-        verts = [
-            (cx - half, cy - half), (cx + half, cy - half),
-            (cx + half, cy - half), (cx + half, cy + half),
-            (cx + half, cy + half), (cx - half, cy + half),
-            (cx - half, cy + half), (cx - half, cy - half),
-        ]
-        batch = batch_for_shader(shader, "LINES", {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", color)
-        batch.draw(shader)
-
-
-def _draw_arrow_2d(shader, tip, back_dir, color, kind):
+def _draw_arrow_2d(shader, tip, back_dir, color):
     dx, dy = back_dir
     norm = math.hypot(dx, dy) or 1.0
     ux, uy = dx / norm, dy / norm
     px, py = -uy, ux
-    if kind == "v":
-        size = 12
-        _draw_polyline_2d(shader, [
-            (tip[0], tip[1]),
-            (tip[0] - ux * size + px * 7, tip[1] - uy * size + py * 7),
-            (tip[0] - ux * size - px * 7, tip[1] - uy * size - py * 7),
-            (tip[0], tip[1]),
-        ], color)
-    elif kind == "tri":
-        size = 14
-        _draw_tri_2d(shader,
-            (tip[0], tip[1]),
-            (tip[0] - ux * size + px * 8, tip[1] - uy * size + py * 8),
-            (tip[0] - ux * size - px * 8, tip[1] - uy * size - py * 8),
-            color,
-        )
-    elif kind == "dot":
-        _draw_filled_circle_2d(shader, tip, 6.0, color)
+    size = GIZMO_MOVE_ARROW_SIZE
+    _draw_tri_2d(shader,
+        (tip[0], tip[1]),
+        (tip[0] - ux * size + px * (size * 0.55), tip[1] - uy * size + py * (size * 0.55)),
+        (tip[0] - ux * size - px * (size * 0.55), tip[1] - uy * size - py * (size * 0.55)),
+        color,
+    )
 
 
 def draw_move_mode_gizmo():
@@ -1744,12 +1654,10 @@ def draw_move_mode_gizmo():
     if origin is None:
         return
     length = _gizmo_length(context)
-    style = _move_gizmo_style(context)
-    cfg = GIZMO_STYLE_CONFIG.get(style, GIZMO_STYLE_CONFIG["standard"])
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
-    gpu.state.line_width_set(cfg["line"])
+    gpu.state.line_width_set(2.5)
 
     origin_screen = _to_screen(context, origin)
     if not origin_screen:
@@ -1767,63 +1675,42 @@ def draw_move_mode_gizmo():
         axis_dir = axes[axis]
 
         tip_screen = _to_screen(context, origin + axis_dir * length)
-        neg_screen = _to_screen(context, origin - axis_dir * length)
 
-        if cfg["double"]:
-            if neg_screen and tip_screen:
-                _draw_line_2d(shader, (neg_screen.x, neg_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
-        elif tip_screen:
+        if tip_screen:
             _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
+            # solid move arrow
+            _draw_arrow_2d(
+                shader,
+                (tip_screen.x, tip_screen.y),
+                (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
+                accent(color, "move"),
+            )
 
-        if cfg["arrow"]:
-            if tip_screen:
-                _draw_arrow_2d(
-                    shader,
-                    (tip_screen.x, tip_screen.y),
-                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
-                    accent(color, "move"),
-                    cfg["arrow"],
-                )
-            if cfg["double"] and neg_screen:
-                _draw_arrow_2d(
-                    shader,
-                    (neg_screen.x, neg_screen.y),
-                    (neg_screen.x - origin_screen.x, neg_screen.y - origin_screen.y),
-                    accent(color, "move"),
-                    cfg["arrow"],
-                )
+        mid = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
+        if mid:
+            _draw_box_2d(
+                shader,
+                (mid.x, mid.y),
+                accent(color, "scale"),
+                filled=True,
+            )
 
-        if cfg["scale"]:
-            mid = _to_screen(context, origin + axis_dir * length * cfg["scale_pos"])
-            if mid:
-                _draw_box_2d(
-                    shader,
-                    (mid.x, mid.y),
-                    accent(color, "scale"),
-                    filled=(cfg["scale"] == "dot_box"),
-                )
-
-        if cfg["rotate"]:
-            radius = length * cfg["ring_radius"]
-            other1 = axes[(axis + 1) % 3]
-            other2 = axes[(axis + 2) % 3]
-            ring_points = []
-            for t in range(33):
-                ang = 2.0 * math.pi * t / 32
-                world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
-                screen = _to_screen(context, world)
-                if screen:
-                    ring_points.append((screen.x, screen.y))
-            if len(ring_points) >= 3:
-                ring_color = accent(color, "rotate")
-                ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
-                if hover and hover[1] == axis and hover[0] == "rotate":
-                    ring_color = (1.0, 1.0, 1.0, 1.0)
-                _draw_polyline_2d(shader, ring_points, ring_color)
-
-        if cfg["center"]:
-            radius = 4.0 if cfg["center"] == "dot" else 6.0
-            _draw_filled_circle_2d(shader, (origin_screen.x, origin_screen.y), radius, (1.0, 1.0, 1.0, 0.9))
+        radius = length * GIZMO_RING_RADIUS
+        other1 = axes[(axis + 1) % 3]
+        other2 = axes[(axis + 2) % 3]
+        ring_points = []
+        for t in range(33):
+            ang = 2.0 * math.pi * t / 32
+            world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
+            screen = _to_screen(context, world)
+            if screen:
+                ring_points.append((screen.x, screen.y))
+        if len(ring_points) >= 3:
+            ring_color = accent(color, "rotate")
+            ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
+            if hover and hover[1] == axis and hover[0] == "rotate":
+                ring_color = (1.0, 1.0, 1.0, 1.0)
+            _draw_polyline_2d(shader, ring_points, ring_color)
 
     gpu.state.line_width_set(1.0)
     gpu.state.blend_set("NONE")
@@ -1978,12 +1865,6 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.WindowManager.zb_nav_move_gizmo_style = EnumProperty(
-        name="变换轴样式",
-        description="选择移动模式中变换轴的外观",
-        items=ZBNAV_MOVE_GIZMO_STYLES,
-        default="standard",
-    )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
         description="选择要直接切换到雕刻模式的网格对象",
@@ -2018,7 +1899,5 @@ def unregister():
         pass
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
-    if hasattr(bpy.types.WindowManager, "zb_nav_move_gizmo_style"):
-        del bpy.types.WindowManager.zb_nav_move_gizmo_style
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
