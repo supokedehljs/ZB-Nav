@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 7),
+    "version": (1, 15, 8),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -475,10 +475,12 @@ GIZMO_MOVE_TRI_BASE = 0.72
 GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 26.0
 GIZMO_SCALE_RECT_WID = 16.0
-GIZMO_RING_BAND_PX = 3.5
+GIZMO_RING_BAND_PX = 2.0
 GIZMO_RING_SEGMENTS = 96
 GIZMO_CENTER_SQUARE_HALF = 8.0
-GIZMO_CORNER_TRI_SIZE = 22.0
+GIZMO_CORNER_RADIUS = 1.15
+GIZMO_CORNER_TRI_HEIGHT = 18.0
+GIZMO_CORNER_TRI_HALF_WID = 18.0
 
 
 def _get_gizmo_matrix(context):
@@ -627,13 +629,14 @@ def _move_mode_pick(context, mouse_x, mouse_y):
 
         # four corner triangles: translate in the view plane
         corner_angles = (45, 135, 225, 315)
+        corner_radius = length * GIZMO_CORNER_RADIUS
         for corner in range(4):
             rad = math.radians(corner_angles[corner])
-            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * outer_radius
+            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
             screen = _to_screen(context, world)
             if screen:
                 d = math.hypot(mouse_x - screen.x, mouse_y - screen.y)
-                candidates.append((d - 12.0, "view_move", corner))
+                candidates.append((d - 16.0, "view_move", corner))
 
     # center square: uniform scale
     origin_screen = _to_screen(context, origin)
@@ -1925,13 +1928,14 @@ def draw_move_mode_gizmo():
                 outer_color = (1.0, 1.0, 1.0, 1.0)
             _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
-        # four corner triangles: translate in the view plane
+        # four corner triangles: translate in the view plane (squat, farther out)
         corner_angles = (45, 135, 225, 315)
-        tri_side = GIZMO_CORNER_TRI_SIZE * 2.0
-        tri_height = tri_side * math.sqrt(3.0) / 2.0
+        corner_radius = length * GIZMO_CORNER_RADIUS
+        tri_height = GIZMO_CORNER_TRI_HEIGHT
+        tri_half_wid = GIZMO_CORNER_TRI_HALF_WID
         for corner in range(4):
             rad = math.radians(corner_angles[corner])
-            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * outer_radius
+            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
             screen = _to_screen(context, world)
             if not screen:
                 continue
@@ -1945,8 +1949,8 @@ def draw_move_mode_gizmo():
             if hover and hover[0] == "view_move" and hover[1] == corner:
                 corner_color = (1.0, 1.0, 1.0, 1.0)
             apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
-            left = (center[0] + px * tri_side * 0.5, center[1] + py * tri_side * 0.5)
-            right = (center[0] - px * tri_side * 0.5, center[1] - py * tri_side * 0.5)
+            left = (center[0] + px * tri_half_wid, center[1] + py * tri_half_wid)
+            right = (center[0] - px * tri_half_wid, center[1] - py * tri_half_wid)
             _draw_tri_2d(shader, apex, left, right, corner_color)
     except Exception:
         pass
