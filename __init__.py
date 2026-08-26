@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 9),
+    "version": (1, 10, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -13,7 +13,7 @@ import math
 import blf
 import bpy
 import gpu
-from bpy.props import BoolProperty, FloatProperty, PointerProperty
+from bpy.props import FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -31,7 +31,6 @@ MAX_BRUSH_SIZE = 5000
 
 ZBRUSH_KEYMAP_ITEMS = [
     {
-        "feature": "pan_zoom",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.pan_or_zoom",
@@ -41,7 +40,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
-        "feature": "mask_correction",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.alt_select_or_invert",
@@ -52,7 +50,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
-        "feature": "target_switch",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.alt_select_target",
@@ -62,7 +59,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
-        "feature": "target_switch",
         "keymap": "Sculpt",
         "space_type": "EMPTY",
         "idname": "zb_nav.alt_select_target",
@@ -72,7 +68,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
-        "feature": "brush_size",
         "keymap": "3D View",
         "space_type": "VIEW_3D",
         "idname": "zb_nav.space_brush_size",
@@ -81,7 +76,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "properties": {},
     },
     {
-        "feature": "brush_size",
         "keymap": "Sculpt",
         "space_type": "EMPTY",
         "idname": "zb_nav.space_brush_size",
@@ -91,98 +85,11 @@ ZBRUSH_KEYMAP_ITEMS = [
     },
 ]
 
-ZBNAV_FEATURES = (
-    ("pan_zoom", "Alt + 鼠标中键 平移/缩放视图"),
-    ("mask_correction", "Ctrl 遮罩修正"),
-    ("target_switch", "Alt + 鼠标左键 切换雕刻目标"),
-    ("brush_size", "空格 + 鼠标左键 调整笔刷大小"),
-)
-
-
 def get_preferences(context):
     addon = context.preferences.addons.get(__name__)
     if addon:
         return addon.preferences
     return None
-
-
-def feature_enabled(feature_name):
-    return getattr(
-        bpy.context.window_manager,
-        "zb_nav_enable_" + feature_name,
-        True,
-    )
-
-
-def _make_feature_update(feature_name):
-    def update(self, context):
-        if is_zbrush_sculpt_mode(context):
-            update_feature_keymaps(feature_name)
-            tag_all_view3d_areas_for_redraw()
-    return update
-
-
-def update_feature_keymaps(feature_name):
-    active = feature_enabled(feature_name)
-    found = False
-    for _km, kmi, entry_feature in ADDON_KEYMAPS:
-        if entry_feature == feature_name:
-            kmi.active = active
-            found = True
-    if active and not found:
-        _add_feature_items(feature_name)
-    _apply_feature_side_effect(feature_name)
-    _dump_diagnostic("toggle:%s=%s" % (feature_name, active))
-
-
-def _apply_feature_side_effect(feature_name):
-    active = feature_enabled(feature_name)
-    if feature_name == "target_switch":
-        if active:
-            swap_sculpt_brush_modifiers()
-        else:
-            restore_sculpt_brush_modifiers()
-    elif feature_name == "pan_zoom":
-        if active:
-            remap_view_rotate_axis_snap()
-        else:
-            restore_view_rotate_axis_snap()
-    elif feature_name == "brush_size":
-        if active:
-            suspend_plain_space_keymaps()
-        else:
-            restore_plain_space_keymaps()
-
-
-def _dump_diagnostic(reason):
-    try:
-        import os
-
-        wm = bpy.context.window_manager
-        lines = []
-        lines.append("=== ZB-Nav diag: %s ===" % reason)
-        lines.append("nav_mode=%s mode=%s" % (get_nav_mode(bpy.context), bpy.context.mode))
-        lines.append("features=%s" % {n: feature_enabled(n) for n, _ in ZBNAV_FEATURES})
-        lines.append("ADDON_KEYMAPS=%d" % len(ADDON_KEYMAPS))
-        kc = wm.keyconfigs.addon
-        if kc:
-            for km in kc.keymaps:
-                for kmi in km.keymap_items:
-                    if "zb_nav" in kmi.idname:
-                        lines.append("  ADDON %s %s t=%s v=%s active=%s" % (
-                            km.name, kmi.idname, kmi.type, kmi.value, kmi.active))
-        uc = wm.keyconfigs.user
-        if uc:
-            for km in uc.keymaps:
-                for kmi in km.keymap_items:
-                    if kmi.type == "SPACE" and "zb_nav" in kmi.idname:
-                        lines.append("  USER-SPACE %s %s active=%s" % (km.name, kmi.idname, kmi.active))
-            lines.append("  user-space-conflicts=%d" % len(SPACE_KEYMAP_CONFLICTS))
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_zb_nav_diag.txt")
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-    except Exception as exc:  # diagnostics must never break the addon
-        print("ZB-Nav diag error:", exc)
 
 
 def get_nav_mode(context):
@@ -260,7 +167,7 @@ def remove_zbrush_keymaps():
         ADDON_KEYMAPS.clear()
         return
 
-    for km, kmi, _feature in ADDON_KEYMAPS:
+    for km, kmi in ADDON_KEYMAPS:
         try:
             km.keymap_items.remove(kmi)
         except (ReferenceError, RuntimeError):
@@ -268,50 +175,33 @@ def remove_zbrush_keymaps():
     ADDON_KEYMAPS.clear()
 
 
-def _remove_feature_items(feature_name):
-    global ADDON_KEYMAPS
-    remaining = []
-    for km, kmi, entry_feature in ADDON_KEYMAPS:
-        if entry_feature == feature_name:
-            try:
-                km.keymap_items.remove(kmi)
-            except (ReferenceError, RuntimeError):
-                pass
-        else:
-            remaining.append((km, kmi, entry_feature))
-    ADDON_KEYMAPS = remaining
-
-
-def _add_feature_items(feature_name):
+def _add_keymap_item(item):
     wm = bpy.context.window_manager
     kc = wm.keyconfigs.addon
     if not kc:
         return
 
-    for item in ZBRUSH_KEYMAP_ITEMS:
-        if item.get("feature") != feature_name:
-            continue
-        km = kc.keymaps.new(
-            name=item.get("keymap", "3D View"),
-            space_type=item.get("space_type", "EMPTY"),
-        )
-        kmi = km.keymap_items.new(
-            item["idname"],
-            type=item["type"],
-            value=item["value"],
-            alt=item.get("alt", False),
-            ctrl=item.get("ctrl", False),
-            shift=item.get("shift", False),
-            oskey=item.get("oskey", False),
-            key_modifier=item.get("key_modifier", "NONE"),
-        )
-        for prop_name, prop_value in item.get("properties", {}).items():
-            try:
-                setattr(kmi.properties, prop_name, prop_value)
-            except (AttributeError, TypeError, ValueError):
-                # Radial-control properties differ between Blender versions.
-                pass
-        ADDON_KEYMAPS.append((km, kmi, feature_name))
+    km = kc.keymaps.new(
+        name=item.get("keymap", "3D View"),
+        space_type=item.get("space_type", "EMPTY"),
+    )
+    kmi = km.keymap_items.new(
+        item["idname"],
+        type=item["type"],
+        value=item["value"],
+        alt=item.get("alt", False),
+        ctrl=item.get("ctrl", False),
+        shift=item.get("shift", False),
+        oskey=item.get("oskey", False),
+        key_modifier=item.get("key_modifier", "NONE"),
+    )
+    for prop_name, prop_value in item.get("properties", {}).items():
+        try:
+            setattr(kmi.properties, prop_name, prop_value)
+        except (AttributeError, TypeError, ValueError):
+            # Radial-control properties differ between Blender versions.
+            pass
+    ADDON_KEYMAPS.append((km, kmi))
 
 
 def swap_sculpt_brush_modifiers():
@@ -505,28 +395,14 @@ def select_or_invert_sculpt_target(context, event):
     return {"FINISHED"} if success else {"CANCELLED"}
 
 
-def _apply_side_effects():
-    if feature_enabled("target_switch"):
-        swap_sculpt_brush_modifiers()
-    else:
-        restore_sculpt_brush_modifiers()
-    if feature_enabled("pan_zoom"):
-        remap_view_rotate_axis_snap()
-    else:
-        restore_view_rotate_axis_snap()
-    if feature_enabled("brush_size"):
-        suspend_plain_space_keymaps()
-    else:
-        restore_plain_space_keymaps()
-
-
 def add_zbrush_keymaps():
     remove_zbrush_keymaps()
-    _apply_side_effects()
+    swap_sculpt_brush_modifiers()
+    remap_view_rotate_axis_snap()
+    suspend_plain_space_keymaps()
 
-    for feature_name, _label in ZBNAV_FEATURES:
-        if feature_enabled(feature_name):
-            _add_feature_items(feature_name)
+    for item in ZBRUSH_KEYMAP_ITEMS:
+        _add_keymap_item(item)
 
 
 def update_navigation_mode(context, mode):
@@ -542,7 +418,6 @@ def update_navigation_mode(context, mode):
         restore_view_rotate_axis_snap()
         restore_plain_space_keymaps()
     set_nav_mode(context, mode)
-    _dump_diagnostic("mode_" + mode.lower())
     tag_all_view3d_areas_for_redraw()
     return True
 
@@ -760,12 +635,12 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        wm = context.window_manager
 
-        layout.label(text="ZBrush 功能开关", icon="PREFERENCES")
-        column = layout.column(align=True)
-        for feature_name, label in ZBNAV_FEATURES:
-            column.prop(wm, "zb_nav_enable_" + feature_name, text=label)
+        box = layout.box()
+        box.label(text="Alt + 鼠标中键  平移 / 缩放视图", icon="MOUSE_MOVE")
+        box.label(text="Ctrl + 鼠标中键  遮罩修正", icon="BRUSH_MASK")
+        box.label(text="Alt + 鼠标左键  切换雕刻目标", icon="OBJECT_DATA")
+        box.label(text="空格 + 鼠标左键  调整笔刷大小", icon="BRUSH_DATA")
 
 
 class ZBNAV_BrushSizeMixin:
@@ -1123,15 +998,6 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    for feature_name, _label in ZBNAV_FEATURES:
-        setattr(
-            bpy.types.WindowManager,
-            "zb_nav_enable_" + feature_name,
-            BoolProperty(
-                default=True,
-                update=_make_feature_update(feature_name),
-            ),
-        )
     bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
         name="雕刻目标",
         description="选择要直接切换到雕刻模式的网格对象",
@@ -1156,9 +1022,5 @@ def unregister():
     tag_all_view3d_areas_for_redraw()
     if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
         del bpy.types.WindowManager.zb_nav_sculpt_target
-    for feature_name, _label in ZBNAV_FEATURES:
-        prop_name = "zb_nav_enable_" + feature_name
-        if hasattr(bpy.types.WindowManager, prop_name):
-            delattr(bpy.types.WindowManager, prop_name)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
