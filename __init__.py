@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 13, 3),
+    "version": (1, 13, 4),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -626,7 +626,7 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
     bl_idname = "zb_nav.move_mode"
     bl_label = "Move Mode"
     bl_description = "在物体原点显示移动/缩放/旋转轴，拖动轴控制物体变换"
-    bl_options = {"REGISTER", "BLOCKING"}
+    bl_options = {"REGISTER"}
 
     _drag_handle = None
     _last_x = 0
@@ -807,7 +807,7 @@ class ZBNAV_OT_toggle_move_mode(bpy.types.Operator):
 class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
     bl_idname = "zb_nav.ctrl_diagnostic_monitor"
     bl_label = "Ctrl Mask Helper"
-    bl_options = {"INTERNAL", "BLOCKING"}
+    bl_options = {"INTERNAL"}
 
     _lasso_active = False
     _lasso_points = []
