@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 4),
+    "version": (1, 15, 5),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -905,19 +905,18 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         elif kind == "scale_all":
             origin_screen = _to_screen(context, origin)
             if origin_screen:
-                prev_dist = math.hypot(
-                    self._last_x - origin_screen.x, self._last_y - origin_screen.y
-                )
-                cur_dist = math.hypot(
+                normal = mathutils.Vector((1, -1)).normalized()
+                mouse_vec = mathutils.Vector((
                     event.mouse_region_x - origin_screen.x,
                     event.mouse_region_y - origin_screen.y,
-                )
-                factor = max(0.001, 1.0 + (cur_dist - prev_dist) / GIZMO_PIXEL_SIZE)
-                scale_mat = mathutils.Matrix.Scale(factor, 4)
-                translation = mathutils.Matrix.Translation(origin)
-                obj.matrix_world = (
-                    translation @ scale_mat @ translation.inverted() @ obj.matrix_world
-                )
+                ))
+                signed = mouse_vec.dot(normal)
+                factor = max(0.001, 1.0 + signed / GIZMO_PIXEL_SIZE)
+                scale = obj.scale.copy()
+                scale *= factor
+                obj.scale = scale
+                obj_offset = obj.matrix_world.translation - origin
+                obj.location += obj_offset * (factor - 1.0)
         else:
             axis_dir = axes[axis]
 
@@ -941,9 +940,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 obj.scale = scale
                 obj_offset = obj.matrix_world.translation - origin
                 projected = obj_offset.dot(axis_dir) * (factor - 1.0)
-                matrix = obj.matrix_world.copy()
-                matrix.translation += axis_dir * projected
-                obj.matrix_world = matrix
+                obj.location += axis_dir * projected
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
@@ -1902,6 +1899,8 @@ def draw_move_mode_gizmo():
 
         # four corner triangles: translate in the view plane
         corner_angles = (45, 135, 225, 315)
+        tri_side = GIZMO_CORNER_TRI_SIZE * 2.0
+        tri_height = tri_side * math.sqrt(3.0) / 2.0
         for corner in range(4):
             rad = math.radians(corner_angles[corner])
             world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * outer_radius
@@ -1909,22 +1908,30 @@ def draw_move_mode_gizmo():
             if not screen:
                 continue
             center = (screen.x, screen.y)
-            radial = (screen.x - origin_screen.x, screen.y - origin_screen.y)
+            rx = screen.x - origin_screen.x
+            ry = screen.y - origin_screen.y
+            rnorm = math.hypot(rx, ry) or 1.0
+            dx, dy = rx / rnorm, ry / rnorm
+            px, py = -dy, dx
             corner_color = (1.0, 1.0, 1.0, 0.8)
             if hover and hover[0] == "view_move" and hover[1] == corner:
                 corner_color = (1.0, 1.0, 1.0, 1.0)
-            _draw_tri_along_axis(
-                shader,
-                (center[0] + radial[0], center[1] + radial[1]),
-                center,
-                corner_color,
-                GIZMO_CORNER_TRI_SIZE,
-            )
+            apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
+            left = (center[0] + px * tri_side * 0.5, center[1] + py * tri_side * 0.5)
+            right = (center[0] - px * tri_side * 0.5, center[1] - py * tri_side * 0.5)
+            _draw_tri_2d(shader, apex, left, right, corner_color)
     except Exception:
         pass
 
-    # center square: uniform scale
+    # center square: uniform scale (with diagonal reference line)
     try:
+        diag = mathutils.Vector((1, 1)).normalized()
+        span = GIZMO_PIXEL_SIZE * 1.25
+        _draw_line_2d(shader,
+            (origin_screen.x - diag.x * span, origin_screen.y - diag.y * span),
+            (origin_screen.x + diag.x * span, origin_screen.y + diag.y * span),
+            (1.0, 1.0, 1.0, 0.15),
+        )
         center_color = (1.0, 1.0, 1.0, 0.9)
         if hover and hover[0] == "scale_all":
             center_color = (1.0, 1.0, 1.0, 1.0)
