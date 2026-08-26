@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 13, 2),
+    "version": (1, 13, 3),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1203,22 +1203,12 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
 
         move_box = layout.box()
         active = getattr(wm, "zb_nav_move_mode_active", False)
-        move_box.label(
-            text="移动模式（物体原点变换轴）",
-            icon="ORIENTATION_GLOBAL",
-        )
+        move_box.label(text="移动模式（物体原点变换轴）")
         move_box.prop(wm, "zb_nav_move_gizmo_style", text="轴样式")
         move_box.operator(
             ZBNAV_OT_toggle_move_mode.bl_idname,
             text="退出移动模式" if active else "开启移动模式",
             depress=active,
-            icon="TRANSFORM_MOVE",
-        )
-        move_box.operator(
-            ZBNAV_OT_toggle_move_mode.bl_idname,
-            text="退出移动模式" if active else "开启移动模式",
-            depress=active,
-            icon="ORIENTATION_GLOBAL",
         )
 
         layout.separator()
