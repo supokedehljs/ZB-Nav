@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 9, 8),
+    "version": (1, 9, 9),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -123,10 +123,66 @@ def _make_feature_update(feature_name):
 
 
 def update_feature_keymaps(feature_name):
-    _remove_feature_items(feature_name)
-    if feature_enabled(feature_name):
+    active = feature_enabled(feature_name)
+    found = False
+    for _km, kmi, entry_feature in ADDON_KEYMAPS:
+        if entry_feature == feature_name:
+            kmi.active = active
+            found = True
+    if active and not found:
         _add_feature_items(feature_name)
-    _apply_side_effects()
+    _apply_feature_side_effect(feature_name)
+    _dump_diagnostic("toggle:%s=%s" % (feature_name, active))
+
+
+def _apply_feature_side_effect(feature_name):
+    active = feature_enabled(feature_name)
+    if feature_name == "target_switch":
+        if active:
+            swap_sculpt_brush_modifiers()
+        else:
+            restore_sculpt_brush_modifiers()
+    elif feature_name == "pan_zoom":
+        if active:
+            remap_view_rotate_axis_snap()
+        else:
+            restore_view_rotate_axis_snap()
+    elif feature_name == "brush_size":
+        if active:
+            suspend_plain_space_keymaps()
+        else:
+            restore_plain_space_keymaps()
+
+
+def _dump_diagnostic(reason):
+    try:
+        import os
+
+        wm = bpy.context.window_manager
+        lines = []
+        lines.append("=== ZB-Nav diag: %s ===" % reason)
+        lines.append("nav_mode=%s mode=%s" % (get_nav_mode(bpy.context), bpy.context.mode))
+        lines.append("features=%s" % {n: feature_enabled(n) for n, _ in ZBNAV_FEATURES})
+        lines.append("ADDON_KEYMAPS=%d" % len(ADDON_KEYMAPS))
+        kc = wm.keyconfigs.addon
+        if kc:
+            for km in kc.keymaps:
+                for kmi in km.keymap_items:
+                    if "zb_nav" in kmi.idname:
+                        lines.append("  ADDON %s %s t=%s v=%s active=%s" % (
+                            km.name, kmi.idname, kmi.type, kmi.value, kmi.active))
+        uc = wm.keyconfigs.user
+        if uc:
+            for km in uc.keymaps:
+                for kmi in km.keymap_items:
+                    if kmi.type == "SPACE" and "zb_nav" in kmi.idname:
+                        lines.append("  USER-SPACE %s %s active=%s" % (km.name, kmi.idname, kmi.active))
+            lines.append("  user-space-conflicts=%d" % len(SPACE_KEYMAP_CONFLICTS))
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_zb_nav_diag.txt")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as exc:  # diagnostics must never break the addon
+        print("ZB-Nav diag error:", exc)
 
 
 def get_nav_mode(context):
@@ -486,6 +542,7 @@ def update_navigation_mode(context, mode):
         restore_view_rotate_axis_snap()
         restore_plain_space_keymaps()
     set_nav_mode(context, mode)
+    _dump_diagnostic("mode_" + mode.lower())
     tag_all_view3d_areas_for_redraw()
     return True
 
