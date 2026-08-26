@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 14, 0),
+    "version": (1, 14, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -622,6 +622,62 @@ def _move_mode_pick(context, mouse_x, mouse_y, style):
     return None
 
 
+def _raycast_surface(context, mouse_x, mouse_y):
+    region = context.region
+    region_3d = context.region_data
+    if not region or not region_3d:
+        return None, None, None
+    origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, (mouse_x, mouse_y))
+    direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, (mouse_x, mouse_y))
+    hit, location, normal, _index, _obj, _matrix = context.scene.ray_cast(
+        context.evaluated_depsgraph_get(),
+        origin,
+        direction,
+    )
+    if hit:
+        return location, normal, _obj
+    return None, None, None
+
+
+def _set_origin_to_world_point(obj, world_point):
+    matrix = obj.matrix_world.copy()
+    offset_world = matrix.translation - world_point
+    offset_local = matrix.to_3x3().inverted() @ offset_world
+    try:
+        obj.data.transform(mathutils.Matrix.Translation(offset_local))
+    except (AttributeError, ValueError, RuntimeError):
+        return
+    matrix.translation = world_point.copy()
+    obj.matrix_world = matrix
+
+
+def _set_origin_z_to_direction(obj, world_direction):
+    direction = world_direction.normalized()
+    if direction.length < 1e-6:
+        return
+    reference = obj.matrix_world.to_3x3()
+    old_x = reference @ mathutils.Vector((1, 0, 0))
+    new_x = old_x - direction * old_x.dot(direction)
+    if new_x.length < 1e-5:
+        old_y = reference @ mathutils.Vector((0, 1, 0))
+        new_x = old_y - direction * old_y.dot(direction)
+    if new_x.length < 1e-5:
+        fallback = mathutils.Vector((1, 0, 0)) if abs(direction.z) < 0.999 else mathutils.Vector((0, 1, 0))
+        new_x = fallback - direction * fallback.dot(direction)
+    new_x.normalize()
+    new_y = direction.cross(new_x)
+    new_rotation = mathutils.Matrix((
+        (new_x[0], new_y[0], direction[0]),
+        (new_x[1], new_y[1], direction[1]),
+        (new_x[2], new_y[2], direction[2]),
+    ))
+    loc, _rot, scale = obj.matrix_world.decompose()
+    try:
+        obj.matrix_world = mathutils.Matrix.LocRotScale(loc, new_rotation, scale)
+    except (ValueError, RuntimeError):
+        pass
+
+
 def _is_move_tool_active(context):
     try:
         from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
@@ -642,10 +698,12 @@ class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
     bl_widget = None
     bl_keymap = (
         ("zb_nav.move_mode_drag", {"type": "LEFTMOUSE", "value": "PRESS"}, None),
+        ("zb_nav.move_mode_drag", {"type": "LEFTMOUSE", "value": "PRESS", "alt": True}, None),
     )
 
     def draw_settings(context, layout, tool):
         layout.label(text="拖动轴：移动 / 缩放 / 旋转")
+        layout.label(text="Alt + 左键：设置原点位置与 Z 朝向")
 
 
 class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
@@ -657,6 +715,8 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     _drag_handle = None
     _last_x = 0
     _last_y = 0
+    _reposition = False
+    _press_point = None
 
     @classmethod
     def poll(cls, context):
@@ -667,7 +727,34 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             and context.area.type == "VIEW_3D"
         )
 
+    def _start_reposition(self, context, event):
+        global MOVE_MODE_HOVER
+        location, normal, _obj = _raycast_surface(
+            context, event.mouse_region_x, event.mouse_region_y
+        )
+        obj = context.active_object
+        if not location or not obj or obj.type != "MESH":
+            return {"CANCELLED"}
+        self._reposition = True
+        self._press_point = location.copy()
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        MOVE_MODE_HOVER = None
+        _set_origin_to_world_point(obj, location)
+        if normal:
+            _set_origin_z_to_direction(obj, normal)
+        try:
+            bpy.ops.ed.undo_push(message="Move Mode Reposition")
+        except (RuntimeError, TypeError):
+            pass
+        context.window_manager.modal_handler_add(self)
+        if context.area:
+            context.area.tag_redraw()
+        return {"RUNNING_MODAL"}
+
     def invoke(self, context, event):
+        if event.alt:
+            return self._start_reposition(context, event)
         global MOVE_MODE_HOVER
         obj = context.active_object
         if not obj or obj.type != "MESH":
@@ -765,6 +852,25 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
             return self._finish(context)
+
+        if self._reposition:
+            if event.type == "MOUSEMOVE":
+                location, _normal, _obj = _raycast_surface(
+                    context, event.mouse_region_x, event.mouse_region_y
+                )
+                obj = context.active_object
+                if location and obj and obj.type == "MESH":
+                    drag = location - self._press_point
+                    _set_origin_to_world_point(obj, location)
+                    if drag.length > 1e-4:
+                        _set_origin_z_to_direction(obj, drag)
+                    if context.area:
+                        context.area.tag_redraw()
+                return {"RUNNING_MODAL"}
+            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+                self._reposition = False
+                return self._finish(context)
+            return {"RUNNING_MODAL"}
 
         if event.type == "MOUSEMOVE":
             self._apply(context, event)
@@ -1176,6 +1282,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         move_box = layout.box()
         move_box.label(text="移动模式（选择左侧移动工具开启）")
         move_box.prop(wm, "zb_nav_move_gizmo_style", text="轴样式")
+        move_box.label(text="Alt + 左键表面：重设原点 / 拖动设 Z 朝向")
 
         layout.separator()
         box = layout.box()
