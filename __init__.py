@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 10),
+    "version": (1, 15, 14),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -498,6 +498,34 @@ def _set_gizmo_matrix(obj_name, matrix):
     MOVE_GIZMO_PIVOT = (obj_name, matrix.copy())
 
 
+def _scale_matrix_about_axis(origin, axis, factor):
+    """Return world-space scaling along one current gizmo axis about its origin."""
+    axis = axis.normalized()
+    amount = factor - 1.0
+    linear = mathutils.Matrix((
+        (1.0 + amount * axis.x * axis.x, amount * axis.x * axis.y, amount * axis.x * axis.z),
+        (amount * axis.y * axis.x, 1.0 + amount * axis.y * axis.y, amount * axis.y * axis.z),
+        (amount * axis.z * axis.x, amount * axis.z * axis.y, 1.0 + amount * axis.z * axis.z),
+    )).to_4x4()
+    return (
+        mathutils.Matrix.Translation(origin)
+        @ linear
+        @ mathutils.Matrix.Translation(-origin)
+    )
+
+
+def _transform_mesh_in_world(obj, world_transform):
+    """Transform mesh vertices in world space without changing object origin."""
+    object_to_world = obj.matrix_world.copy()
+    local_transform = (
+        object_to_world.inverted_safe()
+        @ world_transform
+        @ object_to_world
+    )
+    obj.data.transform(local_transform)
+    obj.data.update()
+
+
 def _gizmo_world_axes(context):
     matrix = _get_gizmo_matrix(context)
     if matrix is None:
@@ -753,6 +781,9 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     _reposition = False
     _pivot_drag = False
     _press_point = None
+    _initial_matrix = None
+    _initial_pivot = None
+    _undo_pushed = False
 
     @classmethod
     def poll(cls, context):
@@ -818,6 +849,17 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         self._drag_handle = handle
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
+        self._initial_matrix = obj.matrix_world.copy()
+        pivot = _get_gizmo_matrix(context)
+        self._initial_pivot = pivot.copy() if pivot is not None else None
+        # Store the pre-drag state. Calling undo_push on release is too late:
+        # it stores the already transformed state and makes the first undo a
+        # no-op. This push is intentionally done only for real object drags.
+        try:
+            bpy.ops.ed.undo_push(message="ZB-Nav Transform")
+            self._undo_pushed = True
+        except (RuntimeError, AttributeError):
+            self._undo_pushed = False
         MOVE_MODE_HOVER = handle
         context.window_manager.modal_handler_add(self)
         if context.area:
@@ -876,9 +918,11 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 view_axis = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
                 rotation = mathutils.Matrix.Rotation(angle, 4, view_axis)
                 translation = mathutils.Matrix.Translation(origin)
-                obj.matrix_world = (
-                    translation @ rotation @ translation.inverted() @ obj.matrix_world
-                )
+                transform = translation @ rotation @ translation.inverted()
+                _transform_mesh_in_world(obj, transform)
+                pivot = _get_gizmo_matrix(context)
+                if pivot is not None:
+                    _set_gizmo_matrix(obj.name, transform @ pivot)
         elif kind == "view_move":
             delta = self._world_delta(context, event)
             region_3d = context.region_data
@@ -886,14 +930,11 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
                 view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
                 move = view_right * delta.dot(view_right) + view_up * delta.dot(view_up)
-                matrix = obj.matrix_world.copy()
-                matrix.translation += move
-                obj.matrix_world = matrix
+                transform = mathutils.Matrix.Translation(move)
+                _transform_mesh_in_world(obj, transform)
                 pivot = _get_gizmo_matrix(context)
                 if pivot is not None:
-                    pivot = pivot.copy()
-                    pivot.translation += move
-                    _set_gizmo_matrix(obj.name, pivot)
+                    _set_gizmo_matrix(obj.name, transform @ pivot)
         elif kind == "scale_all":
             origin_screen = _to_screen(context, origin)
             if origin_screen:
@@ -908,34 +949,27 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                 ))
                 signed_delta = mouse_vec.dot(normal) - prev_vec.dot(normal)
                 factor = max(0.001, 1.0 + signed_delta / GIZMO_PIXEL_SIZE)
-                scale = obj.scale.copy()
-                scale *= factor
-                obj.scale = scale
-                obj_offset = obj.location - origin
-                obj.location += obj_offset * (factor - 1.0)
+                transform = mathutils.Matrix.Translation(origin)
+                transform = transform @ mathutils.Matrix.Scale(factor, 4) @ transform.inverted()
+                _transform_mesh_in_world(obj, transform)
         else:
             axis_dir = axes[axis]
 
             if kind == "move":
                 delta = self._world_delta(context, event)
                 amount = delta.dot(axis_dir)
-                matrix = obj.matrix_world.copy()
-                matrix.translation += axis_dir * amount
-                obj.matrix_world = matrix
+                transform = mathutils.Matrix.Translation(axis_dir * amount)
+                _transform_mesh_in_world(obj, transform)
                 pivot = _get_gizmo_matrix(context)
                 if pivot is not None:
-                    pivot = pivot.copy()
-                    pivot.translation += axis_dir * amount
-                    _set_gizmo_matrix(obj.name, pivot)
+                    _set_gizmo_matrix(obj.name, transform @ pivot)
             elif kind == "scale":
                 delta = self._world_delta(context, event)
                 amount = delta.dot(axis_dir)
                 factor = max(0.001, 1.0 + amount / length)
-                scale_mat = mathutils.Matrix.Scale(factor, 4, axis_dir)
-                translation = mathutils.Matrix.Translation(origin)
-                obj.matrix_world = (
-                    translation @ scale_mat @ translation.inverted() @ obj.matrix_world
-                )
+                # Axis and center both come from the current control gizmo.
+                transform = _scale_matrix_about_axis(origin, axis_dir, factor)
+                _transform_mesh_in_world(obj, transform)
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
@@ -947,12 +981,14 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                         event.mouse_region_y - origin_screen.y,
                         event.mouse_region_x - origin_screen.x,
                     )
-                    angle = cur_angle - prev_angle
+                    angle = -(cur_angle - prev_angle)
                     rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
                     translation = mathutils.Matrix.Translation(origin)
-                    obj.matrix_world = (
-                        translation @ rotation @ translation.inverted() @ obj.matrix_world
-                    )
+                    transform = translation @ rotation @ translation.inverted()
+                    _transform_mesh_in_world(obj, transform)
+                    pivot = _get_gizmo_matrix(context)
+                    if pivot is not None:
+                        _set_gizmo_matrix(obj.name, transform @ pivot)
         self._last_x = event.mouse_region_x
         self._last_y = event.mouse_region_y
         if context.area:
@@ -1021,7 +1057,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                         event.mouse_region_y - origin_screen.y,
                         event.mouse_region_x - origin_screen.x,
                     )
-                    angle = cur_angle - prev_angle
+                    angle = -(cur_angle - prev_angle)
                     rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
                     translation = mathutils.Matrix.Translation(origin)
                     matrix = matrix.copy()
@@ -1039,6 +1075,17 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             return self._finish(context)
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            if not (self._pivot_drag or self._reposition):
+                if self._undo_pushed:
+                    try:
+                        bpy.ops.ed.undo()
+                    except (RuntimeError, AttributeError):
+                        if self._initial_matrix is not None and context.active_object:
+                            context.active_object.matrix_world = self._initial_matrix
+                elif self._initial_matrix is not None and context.active_object:
+                    context.active_object.matrix_world = self._initial_matrix
+            if self._initial_pivot is not None and context.active_object:
+                _set_gizmo_matrix(context.active_object.name, self._initial_pivot)
             return self._finish(context)
 
         if self._pivot_drag:
