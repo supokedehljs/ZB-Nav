@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 0),
+    "version": (1, 15, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -510,17 +510,20 @@ def _gizmo_length(context):
     region_3d = context.region_data
     if not region or not region_3d:
         return 1.0
-    origin_screen = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
-    if origin_screen is None:
+
+    prefs = get_preferences(context)
+    size = prefs.gizmo_size if prefs else 1.0
+    target_pixels = GIZMO_PIXEL_SIZE * max(0.2, size)
+
+    right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+    a = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
+    b = view3d_utils.location_3d_to_region_2d(region, region_3d, origin + right)
+    if not a or not b:
         return 1.0
-    other = view3d_utils.region_2d_to_location_3d(
-        region,
-        region_3d,
-        (origin_screen.x + GIZMO_PIXEL_SIZE, origin_screen.y),
-        origin,
-    )
-    world_len = (other - origin).length
-    return max(world_len, 1e-4)
+    pixels_per_unit = (b - a).length
+    if pixels_per_unit < 1e-6:
+        return 1.0
+    return target_pixels / pixels_per_unit
 
 
 def _to_screen(context, world_pos):
@@ -1168,11 +1171,23 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
+    gizmo_size: FloatProperty(
+        name="控制轴大小",
+        description="移动模式中控制轴在视图里的显示大小",
+        default=1.0,
+        min=0.3,
+        max=3.0,
+        soft_min=0.5,
+        soft_max=2.5,
+        step=10,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "pan_sensitivity")
         layout.prop(self, "zoom_sensitivity")
         layout.prop(self, "brush_size_sensitivity")
+        layout.prop(self, "gizmo_size")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1349,6 +1364,9 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
 
         move_box = layout.box()
         move_box.label(text="移动模式（选择左侧移动工具开启）")
+        prefs = get_preferences(context)
+        if prefs:
+            move_box.prop(prefs, "gizmo_size", text="控制轴大小")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
         move_box.label(text="Alt + 拖把手：只移动/旋转轴心")
 
@@ -1671,46 +1689,48 @@ def draw_move_mode_gizmo():
         return (base[0], base[1], base[2], 1.0)
 
     for axis in range(3):
-        color = MOVE_AXIS_COLORS[axis]
-        axis_dir = axes[axis]
+        try:
+            color = MOVE_AXIS_COLORS[axis]
+            axis_dir = axes[axis]
 
-        tip_screen = _to_screen(context, origin + axis_dir * length)
+            tip_screen = _to_screen(context, origin + axis_dir * length)
 
-        if tip_screen:
-            _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
-            # solid move arrow
-            _draw_arrow_2d(
-                shader,
-                (tip_screen.x, tip_screen.y),
-                (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
-                accent(color, "move"),
-            )
+            if tip_screen:
+                _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
+                # solid move arrow
+                _draw_arrow_2d(
+                    shader,
+                    (tip_screen.x, tip_screen.y),
+                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
+                    accent(color, "move"),
+                )
 
-        mid = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
-        if mid:
-            _draw_box_2d(
-                shader,
-                (mid.x, mid.y),
-                accent(color, "scale"),
-                filled=True,
-            )
+            mid = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
+            if mid:
+                _draw_box_2d(
+                    shader,
+                    (mid.x, mid.y),
+                    accent(color, "scale"),
+                )
 
-        radius = length * GIZMO_RING_RADIUS
-        other1 = axes[(axis + 1) % 3]
-        other2 = axes[(axis + 2) % 3]
-        ring_points = []
-        for t in range(33):
-            ang = 2.0 * math.pi * t / 32
-            world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
-            screen = _to_screen(context, world)
-            if screen:
-                ring_points.append((screen.x, screen.y))
-        if len(ring_points) >= 3:
-            ring_color = accent(color, "rotate")
-            ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
-            if hover and hover[1] == axis and hover[0] == "rotate":
-                ring_color = (1.0, 1.0, 1.0, 1.0)
-            _draw_polyline_2d(shader, ring_points, ring_color)
+            radius = length * GIZMO_RING_RADIUS
+            other1 = axes[(axis + 1) % 3]
+            other2 = axes[(axis + 2) % 3]
+            ring_points = []
+            for t in range(33):
+                ang = 2.0 * math.pi * t / 32
+                world = origin + (other1 * math.cos(ang) + other2 * math.sin(ang)) * radius
+                screen = _to_screen(context, world)
+                if screen:
+                    ring_points.append((screen.x, screen.y))
+            if len(ring_points) >= 3:
+                ring_color = accent(color, "rotate")
+                ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
+                if hover and hover[1] == axis and hover[0] == "rotate":
+                    ring_color = (1.0, 1.0, 1.0, 1.0)
+                _draw_polyline_2d(shader, ring_points, ring_color)
+        except Exception:
+            pass
 
     gpu.state.line_width_set(1.0)
     gpu.state.blend_set("NONE")
