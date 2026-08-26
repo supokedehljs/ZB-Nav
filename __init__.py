@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 12, 2),
+    "version": (1, 12, 3),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -501,7 +501,10 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.0)
                 CTRL_HIT_STATUS = "空白套索未遮罩到物体：已清除全部遮罩"
             else:
-                bpy.ops.paint.mask_lasso_gesture(path=points, value=1.0)
+                bpy.ops.paint.mask_lasso_gesture(
+                    path=[{"location": (px, py)} for px, py in points],
+                    value=1.0,
+                )
                 CTRL_HIT_STATUS = "空白套索：已对物体应用遮罩"
         except Exception as exc:
             CTRL_HIT_STATUS = f"遮罩操作失败: {exc}"
