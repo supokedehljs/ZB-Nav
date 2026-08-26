@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 12, 1),
+    "version": (1, 12, 2),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -491,9 +491,8 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
             context.area.tag_redraw()
         return {"CANCELLED"}
 
-    def _handle_lasso_release(self, context):
+    def _handle_lasso_release(self, context, points):
         global CTRL_HIT_STATUS
-        points = list(self._lasso_points)
         try:
             if _is_lasso_click(points):
                 bpy.ops.paint.mask_flood_fill(mode="VALUE", value=1.0)
@@ -546,10 +545,11 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                     context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
             if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+                points = list(self._lasso_points)
                 self._lasso_active = False
                 self._lasso_points = []
                 CTRL_LASSO_POINTS = []
-                self._handle_lasso_release(context)
+                self._handle_lasso_release(context, points)
                 return {"RUNNING_MODAL"}
 
         if (
