@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 2),
+    "version": (1, 15, 3),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -467,12 +467,12 @@ def _lasso_covers_object(context, points):
 
 MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 
-GIZMO_PIXEL_SIZE = 90.0
+GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
 GIZMO_VIEW_RING_RADIUS = 1.15
-GIZMO_MOVE_TRI_BASE = 0.5
-GIZMO_MOVE_TRI_HALF_WID = 14.0
+GIZMO_MOVE_TRI_BASE = 0.72
+GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 22.0
 GIZMO_SCALE_RECT_WID = 13.0
 GIZMO_RING_LINE_WIDTH = 7.0
@@ -572,7 +572,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
             candidates.append((d - GIZMO_MOVE_TRI_HALF_WID, "move", axis))
         if mid_screen:
             d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
-            candidates.append((d - 10.0, "scale", axis))
+            candidates.append((d - 12.0, "scale", axis))
 
         radius = length * GIZMO_RING_RADIUS
         steps = 24
@@ -861,7 +861,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     event.mouse_region_y - origin_screen.y,
                     event.mouse_region_x - origin_screen.x,
                 )
-                angle = cur_angle - prev_angle
+                angle = -(cur_angle - prev_angle)
                 view_axis = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
                 rotation = mathutils.Matrix.Rotation(angle, 4, view_axis)
                 translation = mathutils.Matrix.Translation(origin)
@@ -885,15 +885,12 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             elif kind == "scale":
                 delta = self._world_delta(context, event)
                 amount = delta.dot(axis_dir)
-                factor = 1.0 + amount / length
-                scale = obj.scale.copy()
-                scale[axis] = max(0.001, scale[axis] * factor)
-                obj.scale = scale
-                obj_offset = obj.matrix_world.translation - origin
-                projected = obj_offset.dot(axis_dir) * (factor - 1.0)
-                matrix = obj.matrix_world.copy()
-                matrix.translation += axis_dir * projected
-                obj.matrix_world = matrix
+                factor = max(0.001, 1.0 + amount / length)
+                scale_mat = mathutils.Matrix.Scale(factor, 4, axis_dir)
+                translation = mathutils.Matrix.Translation(origin)
+                obj.matrix_world = (
+                    translation @ scale_mat @ translation.inverted() @ obj.matrix_world
+                )
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
@@ -942,7 +939,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     event.mouse_region_y - origin_screen.y,
                     event.mouse_region_x - origin_screen.x,
                 )
-                angle = cur_angle - prev_angle
+                angle = -(cur_angle - prev_angle)
                 view_axis = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
                 rotation = mathutils.Matrix.Rotation(angle, 4, view_axis)
                 translation = mathutils.Matrix.Translation(origin)
