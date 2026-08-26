@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 12, 5),
+    "version": (1, 12, 6),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -503,7 +503,11 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
             else:
                 bpy.ops.paint.mask_lasso_gesture(
                     path=[
-                        {"name": str(index), "loc": (px, py)}
+                        {
+                            "name": str(index),
+                            "loc": (px, py),
+                            "time": float(index),
+                        }
                         for index, (px, py) in enumerate(points)
                     ],
                     value=1.0,
