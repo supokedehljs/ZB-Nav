@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 8),
+    "version": (1, 15, 9),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -471,16 +471,16 @@ GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
 GIZMO_VIEW_RING_RADIUS = 0.82
-GIZMO_MOVE_TRI_BASE = 0.72
+GIZMO_MOVE_TRI_BASE = 0.8
 GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 26.0
 GIZMO_SCALE_RECT_WID = 16.0
 GIZMO_RING_BAND_PX = 2.0
 GIZMO_RING_SEGMENTS = 96
 GIZMO_CENTER_SQUARE_HALF = 8.0
-GIZMO_CORNER_RADIUS = 1.15
-GIZMO_CORNER_TRI_HEIGHT = 18.0
-GIZMO_CORNER_TRI_HALF_WID = 18.0
+GIZMO_CORNER_RADIUS = 0.98
+GIZMO_CORNER_TRI_HEIGHT = 22.0
+GIZMO_CORNER_TRI_HALF_WID = 22.0
 
 
 def _get_gizmo_matrix(context):
