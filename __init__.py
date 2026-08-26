@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 13, 0),
+    "version": (1, 13, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -880,6 +880,29 @@ def update_navigation_mode(context, mode):
     return True
 
 
+_AUTO_ZBRUSH_LAST_SCULPT = None
+
+
+def _auto_zbrush_handler(scene, depsgraph):
+    """每次进入雕刻模式时自动开启 ZBrush 子模式。"""
+    global _AUTO_ZBRUSH_LAST_SCULPT
+    context = bpy.context
+    is_sculpt = context.mode == "SCULPT"
+    if is_sculpt == _AUTO_ZBRUSH_LAST_SCULPT:
+        return
+    _AUTO_ZBRUSH_LAST_SCULPT = is_sculpt
+    if (
+        is_sculpt
+        and context.active_object
+        and context.active_object.type == "MESH"
+        and get_nav_mode(context) != "ZBRUSH"
+    ):
+        try:
+            update_navigation_mode(context, "ZBRUSH")
+        except Exception:
+            pass
+
+
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
@@ -1105,7 +1128,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             ZBNAV_OT_toggle_move_mode.bl_idname,
             text="退出移动模式" if active else "开启移动模式",
             depress=active,
-            icon="TRANSFORM_MOVE" if active else "TRANSFORM_MOVE",
+            icon="ORIENTATION_GLOBAL",
         )
 
         layout.separator()
@@ -1343,33 +1366,8 @@ class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
 def draw_zbrush_mode_border():
     context = bpy.context
     draw_move_mode_gizmo()
-    if not is_zbrush_sculpt_mode(context):
-        return
-
-    region = context.region
-    if not region or region.type != "WINDOW":
-        return
-
-    inset = 2.0
-    width = max(float(region.width) - inset, inset)
-    height = max(float(region.height) - inset, inset)
-    vertices = (
-        (inset, inset), (width, inset),
-        (width, inset), (width, height),
-        (width, height), (inset, height),
-        (inset, height), (inset, inset),
-    )
-    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-    batch = batch_for_shader(shader, "LINES", {"pos": vertices})
-
-    gpu.state.blend_set("ALPHA")
-    gpu.state.line_width_set(4.0)
-    shader.bind()
-    shader.uniform_float("color", (1.0, 0.03, 0.03, 1.0))
-    batch.draw(shader)
-    gpu.state.line_width_set(1.0)
-    gpu.state.blend_set("NONE")
-    draw_ctrl_hit_status()
+    if is_zbrush_sculpt_mode(context):
+        draw_ctrl_hit_status()
 
 
 def draw_move_mode_gizmo():
@@ -1644,13 +1642,16 @@ def register():
     )
     register_view3d_header_buttons()
     register_view3d_draw_handler()
-    set_nav_mode(bpy.context, "BLENDER")
+    if not bpy.app.handlers.depsgraph_update_post.count(_auto_zbrush_handler):
+        bpy.app.handlers.depsgraph_update_post.append(_auto_zbrush_handler)
     tag_all_view3d_areas_for_redraw()
 
 
 def unregister():
     global CTRL_DIAGNOSTIC_RUNNING
     CTRL_DIAGNOSTIC_RUNNING = False
+    if bpy.app.handlers.depsgraph_update_post.count(_auto_zbrush_handler):
+        bpy.app.handlers.depsgraph_update_post.remove(_auto_zbrush_handler)
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
     restore_view_rotate_axis_snap()
