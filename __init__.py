@@ -595,6 +595,14 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
             context.area.tag_redraw()
         return {"RUNNING_MODAL"}
 
+    def _in_viewport(self, context):
+        return (
+            context.area
+            and context.area.type == "VIEW_3D"
+            and context.region
+            and context.region.type == "WINDOW"
+        )
+
     def _finish(self, context):
         global MOVE_MODE_HOVER
         MOVE_MODE_HOVER = None
@@ -671,6 +679,12 @@ class ZBNAV_OT_move_mode(bpy.types.Operator):
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
             context.window_manager.zb_nav_move_mode_active = False
             return self._finish(context)
+
+        # Only interact while the cursor is over the 3D viewport; clicks in
+        # panels/other regions must pass through so the UI (e.g. the exit
+        # button) still works.
+        if event.type in {"MOUSEMOVE", "LEFTMOUSE"} and not self._in_viewport(context):
+            return {"PASS_THROUGH"}
 
         if event.type == "MOUSEMOVE":
             if self._drag_handle:
