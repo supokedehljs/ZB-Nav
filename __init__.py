@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 26),
+    "version": (1, 15, 27),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1515,9 +1515,9 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         name="按钮高度",
         description="三个图标按钮距控制轴中心的高度（以轴长为倍数）",
         default=1.15,
-        min=0.4,
-        max=8.0,
-        step=10,
+        min=0.2,
+        max=15.0,
+        step=2,
     )
 
     gizmo_button_spacing: FloatProperty(
@@ -1525,7 +1525,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         description="三个图标按钮之间的水平间距（像素）",
         default=20.0,
         min=8.0,
-        max=60.0,
+        max=100.0,
         step=10,
     )
 
@@ -1534,7 +1534,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         description="三个图标按钮的半径（像素）",
         default=9.0,
         min=5.0,
-        max=22.0,
+        max=30.0,
         step=10,
     )
 
@@ -2034,11 +2034,13 @@ def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
 
 
 def _gizmo_button_positions(context, origin_screen):
-    length = _gizmo_length(context)
     prefs = get_preferences(context)
+    gizmo_size = prefs.gizmo_size if prefs else 1.0
     offset = prefs.gizmo_button_offset if prefs else GIZMO_BUTTON_Y_OFFSET
     spacing = prefs.gizmo_button_spacing if prefs else GIZMO_BUTTON_SPACING
-    base_y = origin_screen.y + length * offset
+    # offset is a multiple of the gizmo's on-screen pixel size
+    pixel_offset = GIZMO_PIXEL_SIZE * gizmo_size * offset
+    base_y = origin_screen.y + pixel_offset
     return [
         (origin_screen.x - spacing, base_y),
         (origin_screen.x, base_y),
