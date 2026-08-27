@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 27),
+    "version": (1, 15, 28),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1511,6 +1511,13 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
 
+    gizmo_button_color: FloatVectorProperty(
+        name="按钮图标颜色",
+        description="三个图标按钮的轮廓颜色",
+        default=(1.0, 1.0, 1.0),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+
     gizmo_button_offset: FloatProperty(
         name="按钮高度",
         description="三个图标按钮距控制轴中心的高度（以轴长为倍数）",
@@ -1550,6 +1557,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "axis_color_z")
         layout.prop(self, "view_ring_color")
         layout.prop(self, "corner_tri_color")
+        layout.prop(self, "gizmo_button_color")
         layout.label(text="按钮位置")
         layout.prop(self, "gizmo_button_offset")
         layout.prop(self, "gizmo_button_spacing")
@@ -1740,6 +1748,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             color_row2 = move_box.row(align=True)
             color_row2.prop(prefs, "view_ring_color")
             color_row2.prop(prefs, "corner_tri_color")
+            move_box.prop(prefs, "gizmo_button_color", text="按钮图标颜色")
             move_box.prop(prefs, "gizmo_button_offset", text="按钮高度")
             move_box.prop(prefs, "gizmo_button_spacing", text="按钮间距")
             move_box.prop(prefs, "gizmo_button_size", text="按钮大小")
@@ -2055,27 +2064,50 @@ def _button_size(context):
     return GIZMO_BUTTON_RADIUS
 
 
-def _draw_button_icon(shader, cx, cy, kind, hover, size):
-    bg = (0.15, 0.15, 0.2, 1.0) if not hover else (0.35, 0.35, 0.45, 1.0)
-    _draw_filled_circle_2d(shader, (cx, cy), size, bg)
+def _button_color(context):
+    return _pref_color3(context, "gizmo_button_color", (1.0, 1.0, 1.0))
+
+
+def _draw_button_icon(shader, cx, cy, kind, hover, size, color):
     s = size / 9.0
+    c = (1.0, 1.0, 1.0, 1.0) if hover else (color[0], color[1], color[2], 1.0)
+    dark = (0.0, 0.0, 0.0, 0.75)
     if kind == 0:
-        # reset rotation: an arc with an arrowhead
+        # reset rotation: outlined arc with an arrowhead
         ring_points = []
         for t in range(25):
             ang = -math.pi * 0.75 + (math.pi * 1.5) * t / 24
-            ring_points.append((cx + math.cos(ang) * 4.2 * s, cy + math.sin(ang) * 4.2 * s))
-        _draw_polyline_2d(shader, ring_points, (1.0, 1.0, 1.0, 1.0))
+            ring_points.append((cx + math.cos(ang) * 4.5 * s, cy + math.sin(ang) * 4.5 * s))
+        gpu.state.line_width_set(3.5 * s)
+        _draw_polyline_2d(shader, ring_points, dark)
+        gpu.state.line_width_set(2.0 * s)
+        _draw_polyline_2d(shader, ring_points, c)
         _draw_tri_2d(shader,
-            (cx + 4.2 * s, cy + 0.6 * s), (cx + 4.2 * s, cy - 1.8 * s), (cx + 6.2 * s, cy - 0.6 * s),
-            (1.0, 1.0, 1.0, 1.0))
+            (cx + 4.5 * s, cy + 0.6 * s), (cx + 4.5 * s, cy - 1.8 * s), (cx + 6.5 * s, cy - 0.6 * s),
+            dark)
+        _draw_tri_2d(shader,
+            (cx + 4.5 * s, cy + 0.4 * s), (cx + 4.5 * s, cy - 1.6 * s), (cx + 6.3 * s, cy - 0.6 * s),
+            c)
     elif kind == 1:
-        # object origin: crosshair
-        _draw_line_2d(shader, (cx - 5 * s, cy), (cx + 5 * s, cy), (1.0, 1.0, 1.0, 1.0))
-        _draw_line_2d(shader, (cx, cy - 5 * s), (cx, cy + 5 * s), (1.0, 1.0, 1.0, 1.0))
+        # object origin: outlined crosshair
+        for off in (-1.2 * s, 1.2 * s):
+            gpu.state.line_width_set(3.5 * s)
+            _draw_line_2d(shader, (cx - 5 * s + off, cy), (cx + 5 * s + off, cy), dark)
+            _draw_line_2d(shader, (cx, cy - 5 * s + off), (cx, cy + 5 * s + off), dark)
+        gpu.state.line_width_set(2.0 * s)
+        _draw_line_2d(shader, (cx - 5 * s, cy), (cx + 5 * s, cy), c)
+        _draw_line_2d(shader, (cx, cy - 5 * s), (cx, cy + 5 * s), c)
     else:
-        # object center: small filled dot
-        _draw_filled_circle_2d(shader, (cx, cy), 2.8 * s, (1.0, 1.0, 1.0, 1.0), segments=12)
+        # object center: outlined circle ring
+        pts = []
+        for t in range(25):
+            ang = 2.0 * math.pi * t / 24
+            pts.append((cx + math.cos(ang) * 4.0 * s, cy + math.sin(ang) * 4.0 * s))
+        gpu.state.line_width_set(3.5 * s)
+        _draw_polyline_2d(shader, pts + [pts[0]], dark)
+        gpu.state.line_width_set(2.0 * s)
+        _draw_polyline_2d(shader, pts + [pts[0]], c)
+    gpu.state.line_width_set(1.0)
 
 
 def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
@@ -2312,10 +2344,11 @@ def draw_move_mode_gizmo():
     # three gizmo buttons above the pivot
     try:
         btn_size = _button_size(context)
+        btn_color = _button_color(context)
         for btn in range(3):
             bx, by = _gizmo_button_positions(context, origin_screen)[btn]
             btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
-            _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size)
+            _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size, btn_color)
     except Exception:
         pass
 
