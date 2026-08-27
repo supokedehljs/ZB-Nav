@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 15),
+    "version": (1, 15, 16),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -476,6 +476,8 @@ GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 26.0
 GIZMO_SCALE_RECT_WID = 16.0
 GIZMO_RING_BAND_PX = 2.0
+GIZMO_RING_TUBE_W = 3.0
+GIZMO_RING_TUBE_H = 7.0
 GIZMO_RING_SEGMENTS = 96
 GIZMO_CENTER_SQUARE_HALF = 8.0
 GIZMO_CORNER_RADIUS = 0.98
@@ -1855,6 +1857,51 @@ def _draw_ring_band_2d(shader, inner_points, outer_points, color):
     batch.draw(shader)
 
 
+def _draw_tube_band_2d(shader, context, origin, e1, e2, radius, tube_w, tube_h, view_dir, color):
+    normal = e1.cross(e2)
+    half_w = tube_w / 2.0
+    half_h = tube_h / 2.0
+    segments = 128
+    # three quad strips: outer wall, inner wall, top (normal+) wall
+    for face in range(3):
+        strip = []
+        for i in range(segments + 1):
+            ang = 2.0 * math.pi * i / segments
+            e = e1 * math.cos(ang) + e2 * math.sin(ang)
+            if e.dot(view_dir) > 0:
+                continue
+            c = origin + e * radius
+            if face == 0:
+                a = c + e * half_w + normal * half_h
+                b = c + e * half_w - normal * half_h
+            elif face == 1:
+                a = c - e * half_w + normal * half_h
+                b = c - e * half_w - normal * half_h
+            else:
+                a = c + normal * half_h + e * half_w
+                b = c + normal * half_h - e * half_w
+            sa = _to_screen(context, a)
+            sb = _to_screen(context, b)
+            if sa and sb:
+                strip.append(((sa.x, sa.y), (sb.x, sb.y)))
+        if len(strip) < 2:
+            continue
+        verts = []
+        for i in range(len(strip) - 1):
+            a1, a2 = strip[i]
+            b1, b2 = strip[i + 1]
+            verts.append(a1)
+            verts.append(a2)
+            verts.append(b2)
+            verts.append(a1)
+            verts.append(b2)
+            verts.append(b1)
+        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+
+
 def draw_move_mode_gizmo():
     context = bpy.context
     if context.mode != "SCULPT":
@@ -1920,27 +1967,23 @@ def draw_move_mode_gizmo():
             radius = length * GIZMO_RING_RADIUS
             other1 = axes[(axis + 1) % 3]
             other2 = axes[(axis + 2) % 3]
-            band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
             view_dir = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
-            inner_points = []
-            outer_points = []
-            for t in range(GIZMO_RING_SEGMENTS + 1):
-                ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
-                dir_vec = other1 * math.cos(ang) + other2 * math.sin(ang)
-                # only draw the camera-facing (front) half of the tube
-                if dir_vec.dot(view_dir) > 0:
-                    continue
-                si = _to_screen(context, origin + dir_vec * (radius - band_world))
-                so = _to_screen(context, origin + dir_vec * (radius + band_world))
-                if si and so:
-                    inner_points.append((si.x, si.y))
-                    outer_points.append((so.x, so.y))
-            if len(inner_points) >= 3:
-                ring_color = accent(color, "rotate")
-                ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
-                if hover and hover[1] == axis and hover[0] == "rotate":
-                    ring_color = (1.0, 1.0, 1.0, 1.0)
-                _draw_ring_band_2d(shader, inner_points, outer_points, ring_color)
+            ring_color = accent(color, "rotate")
+            ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
+            if hover and hover[1] == axis and hover[0] == "rotate":
+                ring_color = (1.0, 1.0, 1.0, 1.0)
+            _draw_tube_band_2d(
+                shader,
+                context,
+                origin,
+                other1,
+                other2,
+                radius,
+                length * (GIZMO_RING_TUBE_W / GIZMO_PIXEL_SIZE),
+                length * (GIZMO_RING_TUBE_H / GIZMO_PIXEL_SIZE),
+                view_dir,
+                ring_color,
+            )
         except Exception:
             pass
 
