@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 18),
+    "version": (1, 15, 19),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1139,6 +1139,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
 
     _lasso_active = False
     _lasso_points = []
+    _lmb_down = False
 
     @classmethod
     def poll(cls, context):
@@ -1149,6 +1150,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         CTRL_DIAGNOSTIC_RUNNING = True
         self._lasso_active = False
         self._lasso_points = []
+        self._lmb_down = False
         CTRL_LASSO_POINTS = []
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
@@ -1208,7 +1210,15 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 context.area.tag_redraw()
             return {"RUNNING_MODAL"}
 
-        if event.ctrl and event.type in {"MOUSEMOVE", "LEFTMOUSE"}:
+        if event.type == "LEFTMOUSE":
+            if event.value == "PRESS":
+                self._lmb_down = True
+            elif event.value == "RELEASE":
+                self._lmb_down = False
+
+        # hover status only when the mouse is not dragging, so the native
+        # mask brush stroke is not disturbed by per-move ray casts.
+        if event.ctrl and event.type == "MOUSEMOVE" and not self._lmb_down:
             CTRL_HIT_STATUS_X = event.mouse_region_x
             CTRL_HIT_STATUS_Y = event.mouse_region_y
             hit_object = find_object_under_mouse(
@@ -1810,17 +1820,6 @@ def _draw_tri_2d(shader, a, b, c, color):
     batch.draw(shader)
 
 
-def _draw_tri_along_axis(shader, apex, base, color, half_width):
-    dx = base[0] - apex[0]
-    dy = base[1] - apex[1]
-    norm = math.hypot(dx, dy) or 1.0
-    ux, uy = dx / norm, dy / norm
-    px, py = -uy, ux
-    left = (base[0] + px * half_width, base[1] + py * half_width)
-    right = (base[0] - px * half_width, base[1] - py * half_width)
-    _draw_tri_2d(shader, (apex[0], apex[1]), left, right, color)
-
-
 def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
     dx, dy = axis_dir_screen
     norm = math.hypot(dx, dy) or 1.0
@@ -1836,6 +1835,47 @@ def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across)
     ]
     _draw_tri_2d(shader, corners[0], corners[1], corners[2], color)
     _draw_tri_2d(shader, corners[0], corners[2], corners[3], color)
+
+
+def _shade(base, amount):
+    return (
+        min(1.0, max(0.0, base[0] + amount)),
+        min(1.0, max(0.0, base[1] + amount)),
+        min(1.0, max(0.0, base[2] + amount)),
+        base[3],
+    )
+
+
+def _draw_cone_2d(shader, apex, base_center, color, half_width):
+    ax, ay = apex
+    bx, by = base_center
+    dx, dy = bx - ax, by - ay
+    norm = math.hypot(dx, dy) or 1.0
+    px, py = -dy / norm, dx / norm
+    left = (bx + px * half_width, by + py * half_width)
+    right = (bx - px * half_width, by - py * half_width)
+    mid = (bx, by)
+    _draw_tri_2d(shader, (ax, ay), (mid[0], mid[1]), left, _shade(color, 0.25))
+    _draw_tri_2d(shader, (ax, ay), right, (mid[0], mid[1]), _shade(color, -0.3))
+
+
+def _draw_box_3d(shader, center, axis_dir_screen, color, along, across):
+    dx, dy = axis_dir_screen
+    norm = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    half_a = along / 2.0
+    half_c = across / 2.0
+    tl = (center[0] - ux * half_a + px * half_c, center[1] - uy * half_a + py * half_c)
+    tr = (center[0] + ux * half_a + px * half_c, center[1] + uy * half_a + py * half_c)
+    br = (center[0] + ux * half_a - px * half_c, center[1] + uy * half_a - py * half_c)
+    bl = (center[0] - ux * half_a - px * half_c, center[1] - uy * half_a - py * half_c)
+    ml = ((tl[0] + bl[0]) * 0.5, (tl[1] + bl[1]) * 0.5)
+    mr = ((tr[0] + br[0]) * 0.5, (tr[1] + br[1]) * 0.5)
+    _draw_tri_2d(shader, tl, tr, mr, _shade(color, 0.3))
+    _draw_tri_2d(shader, tl, mr, ml, _shade(color, 0.3))
+    _draw_tri_2d(shader, ml, mr, br, _shade(color, -0.25))
+    _draw_tri_2d(shader, ml, br, bl, _shade(color, -0.25))
 
 
 def _draw_ring_band_2d(shader, inner_points, outer_points, color):
@@ -1862,37 +1902,44 @@ def _draw_tube_band_2d(shader, context, origin, e1, e2, radius, tube_w, tube_h, 
     half_w = tube_w / 2.0
     half_h = tube_h / 2.0
     segments = 128
-    # only the outer wall of the camera-facing half, so it always reads as a
-    # clean "C" arc with no inner rim or chord.
-    strip = []
-    for i in range(segments + 1):
-        ang = 2.0 * math.pi * i / segments
-        e = e1 * math.cos(ang) + e2 * math.sin(ang)
-        if e.dot(view_dir) > 0:
+    # two walls, each back-face culled by its own normal:
+    # outer wall shows on the camera-facing half, inner wall on the far half.
+    for face in range(2):
+        strip = []
+        for i in range(segments + 1):
+            ang = 2.0 * math.pi * i / segments
+            e = e1 * math.cos(ang) + e2 * math.sin(ang)
+            c = origin + e * radius
+            if face == 0:
+                if e.dot(view_dir) >= 0:
+                    continue
+                a = c + e * half_w + normal * half_h
+                b = c + e * half_w - normal * half_h
+            else:
+                if e.dot(view_dir) <= 0:
+                    continue
+                a = c - e * half_w + normal * half_h
+                b = c - e * half_w - normal * half_h
+            sa = _to_screen(context, a)
+            sb = _to_screen(context, b)
+            if sa and sb:
+                strip.append(((sa.x, sa.y), (sb.x, sb.y)))
+        if len(strip) < 2:
             continue
-        c = origin + e * radius
-        a = c + e * half_w + normal * half_h
-        b = c + e * half_w - normal * half_h
-        sa = _to_screen(context, a)
-        sb = _to_screen(context, b)
-        if sa and sb:
-            strip.append(((sa.x, sa.y), (sb.x, sb.y)))
-    if len(strip) < 2:
-        return
-    verts = []
-    for i in range(len(strip) - 1):
-        a1, a2 = strip[i]
-        b1, b2 = strip[i + 1]
-        verts.append(a1)
-        verts.append(a2)
-        verts.append(b2)
-        verts.append(a1)
-        verts.append(b2)
-        verts.append(b1)
-    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
+        verts = []
+        for i in range(len(strip) - 1):
+            a1, a2 = strip[i]
+            b1, b2 = strip[i + 1]
+            verts.append(a1)
+            verts.append(a2)
+            verts.append(b2)
+            verts.append(a1)
+            verts.append(b2)
+            verts.append(b1)
+        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
 
 
 def draw_move_mode_gizmo():
@@ -1938,25 +1985,6 @@ def draw_move_mode_gizmo():
             if tip_screen and origin_screen:
                 _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
 
-            if tip_screen and base_screen:
-                _draw_tri_along_axis(
-                    shader,
-                    (tip_screen.x, tip_screen.y),
-                    (base_screen.x, base_screen.y),
-                    accent(color, "move"),
-                    GIZMO_MOVE_TRI_HALF_WID,
-                )
-
-            if mid_screen and tip_screen and origin_screen:
-                _draw_rect_along_axis(
-                    shader,
-                    (mid_screen.x, mid_screen.y),
-                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
-                    accent(color, "scale"),
-                    GIZMO_SCALE_RECT_LEN,
-                    GIZMO_SCALE_RECT_WID,
-                )
-
             radius = length * GIZMO_RING_RADIUS
             other1 = axes[(axis + 1) % 3]
             other2 = axes[(axis + 2) % 3]
@@ -1975,6 +2003,26 @@ def draw_move_mode_gizmo():
                 view_dir,
                 ring_color,
             )
+
+            # handles drawn on top of the rings so they are never hidden
+            if tip_screen and base_screen:
+                _draw_cone_2d(
+                    shader,
+                    (tip_screen.x, tip_screen.y),
+                    (base_screen.x, base_screen.y),
+                    accent(color, "move"),
+                    GIZMO_MOVE_TRI_HALF_WID,
+                )
+
+            if mid_screen and tip_screen and origin_screen:
+                _draw_box_3d(
+                    shader,
+                    (mid_screen.x, mid_screen.y),
+                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
+                    accent(color, "scale"),
+                    GIZMO_SCALE_RECT_LEN,
+                    GIZMO_SCALE_RECT_WID,
+                )
         except Exception:
             pass
 
