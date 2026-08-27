@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 24),
+    "version": (1, 15, 25),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -474,6 +474,15 @@ def _axis_color(context, axis):
         if prop is not None:
             return (prop[0], prop[1], prop[2])
     return MOVE_AXIS_COLORS[axis]
+
+
+def _pref_color3(context, name, fallback):
+    prefs = get_preferences(context)
+    if prefs:
+        prop = getattr(prefs, name, None)
+        if prop is not None:
+            return (prop[0], prop[1], prop[2])
+    return fallback
 
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
@@ -1487,6 +1496,38 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
 
+    view_ring_color: FloatVectorProperty(
+        name="视图旋转圈颜色",
+        description="视图旋转外圈颜色",
+        default=(1.0, 1.0, 1.0),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+
+    corner_tri_color: FloatVectorProperty(
+        name="视图平移三角颜色",
+        description="四个视图平移角三角颜色",
+        default=(1.0, 1.0, 1.0),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+
+    gizmo_button_offset: FloatProperty(
+        name="按钮高度",
+        description="三个图标按钮距控制轴中心的高度（以轴长为倍数）",
+        default=1.15,
+        min=0.4,
+        max=2.5,
+        step=10,
+    )
+
+    gizmo_button_spacing: FloatProperty(
+        name="按钮间距",
+        description="三个图标按钮之间的水平间距（像素）",
+        default=20.0,
+        min=8.0,
+        max=50.0,
+        step=10,
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "pan_sensitivity")
@@ -1497,6 +1538,11 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "axis_color_x")
         layout.prop(self, "axis_color_y")
         layout.prop(self, "axis_color_z")
+        layout.prop(self, "view_ring_color")
+        layout.prop(self, "corner_tri_color")
+        layout.label(text="按钮位置")
+        layout.prop(self, "gizmo_button_offset")
+        layout.prop(self, "gizmo_button_spacing")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1680,6 +1726,11 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             color_row.prop(prefs, "axis_color_x")
             color_row.prop(prefs, "axis_color_y")
             color_row.prop(prefs, "axis_color_z")
+            color_row2 = move_box.row(align=True)
+            color_row2.prop(prefs, "view_ring_color")
+            color_row2.prop(prefs, "corner_tri_color")
+            move_box.prop(prefs, "gizmo_button_offset", text="按钮高度")
+            move_box.prop(prefs, "gizmo_button_spacing", text="按钮间距")
         move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
 
@@ -1972,11 +2023,14 @@ def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
 
 def _gizmo_button_positions(context, origin_screen):
     length = _gizmo_length(context)
-    base_y = origin_screen.y + length * 1.15
+    prefs = get_preferences(context)
+    offset = prefs.gizmo_button_offset if prefs else GIZMO_BUTTON_Y_OFFSET
+    spacing = prefs.gizmo_button_spacing if prefs else GIZMO_BUTTON_SPACING
+    base_y = origin_screen.y + length * offset
     return [
-        (origin_screen.x - GIZMO_BUTTON_SPACING, base_y),
+        (origin_screen.x - spacing, base_y),
         (origin_screen.x, base_y),
-        (origin_screen.x + GIZMO_BUTTON_SPACING, base_y),
+        (origin_screen.x + spacing, base_y),
     ]
 
 
@@ -2185,7 +2239,8 @@ def draw_move_mode_gizmo():
                 inner_points.append((si.x, si.y))
                 outer_points.append((so.x, so.y))
         if len(inner_points) >= 3:
-            outer_color = (1.0, 1.0, 1.0, 1.0)
+            vr = _pref_color3(context, "view_ring_color", (1.0, 1.0, 1.0))
+            outer_color = (vr[0], vr[1], vr[2], 1.0)
             _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
         # four corner triangles: translate in the view plane (squat, farther out)
@@ -2205,7 +2260,8 @@ def draw_move_mode_gizmo():
             rnorm = math.hypot(rx, ry) or 1.0
             dx, dy = rx / rnorm, ry / rnorm
             px, py = -dy, dx
-            corner_color = (1.0, 1.0, 1.0, 1.0)
+            corner_color = _pref_color3(context, "corner_tri_color", (1.0, 1.0, 1.0))
+            corner_color = (corner_color[0], corner_color[1], corner_color[2], 1.0)
             if hover and hover[0] == "view_move" and hover[1] == corner:
                 corner_color = (1.0, 1.0, 1.0, 1.0)
             apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
