@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 19),
+    "version": (1, 15, 20),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1138,6 +1138,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
 
     _lasso_active = False
     _lasso_points = []
+    _native_mask_active = False
 
     @classmethod
     def poll(cls, context):
@@ -1148,6 +1149,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         CTRL_DIAGNOSTIC_RUNNING = True
         self._lasso_active = False
         self._lasso_points = []
+        self._native_mask_active = False
         CTRL_LASSO_POINTS = []
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
@@ -1196,6 +1198,12 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
             self._lasso_active = False
             self._lasso_points = []
             CTRL_LASSO_POINTS = []
+            return {"PASS_THROUGH"}
+
+        # A native mask stroke started on the model surface; let it run.
+        if self._native_mask_active:
+            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+                self._native_mask_active = False
             return {"PASS_THROUGH"}
 
         if event.type == "ESC" and event.value == "PRESS":
@@ -1251,6 +1259,22 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 CTRL_HIT_STATUS = "空白命中：拖动画套索，或直接点击填充全部遮罩"
                 if context.area:
                     context.area.tag_redraw()
+                return {"RUNNING_MODAL"}
+            else:
+                # ZBrush-style Ctrl+Left on the model surface draws a mask via
+                # the native sculpt mask brush stroke.
+                self._native_mask_active = True
+                try:
+                    bpy.ops.sculpt.brush_stroke(
+                        "INVOKE_DEFAULT",
+                        brush_toggle="MASK",
+                    )
+                except (RuntimeError, TypeError) as exc:
+                    self._native_mask_active = False
+                    CTRL_HIT_STATUS = f"遮罩笔触启动失败: {exc}"
+                    if context.area:
+                        context.area.tag_redraw()
+                    return {"RUNNING_MODAL"}
                 return {"RUNNING_MODAL"}
 
         # Ctrl + 左键点击模型表面交给 Blender 原生遮罩笔刷。
