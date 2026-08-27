@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 25),
+    "version": (1, 15, 26),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -730,10 +730,11 @@ def _move_mode_pick(context, mouse_x, mouse_y):
         candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
 
         # three gizmo buttons above the pivot
+        btn_size = _button_size(context)
         for btn in range(3):
             bx, by = _gizmo_button_positions(context, origin_screen)[btn]
             d = math.hypot(mouse_x - bx, mouse_y - by)
-            candidates.append((d - GIZMO_BUTTON_RADIUS, "gizmo_button", btn))
+            candidates.append((d - btn_size, "gizmo_button", btn))
 
     candidates.sort(key=lambda item: item[0])
     if candidates and candidates[0][0] < 6.0:
@@ -1515,7 +1516,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         description="三个图标按钮距控制轴中心的高度（以轴长为倍数）",
         default=1.15,
         min=0.4,
-        max=2.5,
+        max=8.0,
         step=10,
     )
 
@@ -1524,7 +1525,16 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         description="三个图标按钮之间的水平间距（像素）",
         default=20.0,
         min=8.0,
-        max=50.0,
+        max=60.0,
+        step=10,
+    )
+
+    gizmo_button_size: FloatProperty(
+        name="按钮大小",
+        description="三个图标按钮的半径（像素）",
+        default=9.0,
+        min=5.0,
+        max=22.0,
         step=10,
     )
 
@@ -1543,6 +1553,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout.label(text="按钮位置")
         layout.prop(self, "gizmo_button_offset")
         layout.prop(self, "gizmo_button_spacing")
+        layout.prop(self, "gizmo_button_size")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1731,6 +1742,7 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
             color_row2.prop(prefs, "corner_tri_color")
             move_box.prop(prefs, "gizmo_button_offset", text="按钮高度")
             move_box.prop(prefs, "gizmo_button_spacing", text="按钮间距")
+            move_box.prop(prefs, "gizmo_button_size", text="按钮大小")
         move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
 
@@ -2034,26 +2046,34 @@ def _gizmo_button_positions(context, origin_screen):
     ]
 
 
-def _draw_button_icon(shader, cx, cy, kind, hover):
+def _button_size(context):
+    prefs = get_preferences(context)
+    if prefs:
+        return prefs.gizmo_button_size
+    return GIZMO_BUTTON_RADIUS
+
+
+def _draw_button_icon(shader, cx, cy, kind, hover, size):
     bg = (0.15, 0.15, 0.2, 1.0) if not hover else (0.35, 0.35, 0.45, 1.0)
-    _draw_filled_circle_2d(shader, (cx, cy), GIZMO_BUTTON_RADIUS, bg)
+    _draw_filled_circle_2d(shader, (cx, cy), size, bg)
+    s = size / 9.0
     if kind == 0:
         # reset rotation: an arc with an arrowhead
         ring_points = []
         for t in range(25):
             ang = -math.pi * 0.75 + (math.pi * 1.5) * t / 24
-            ring_points.append((cx + math.cos(ang) * 4.2, cy + math.sin(ang) * 4.2))
+            ring_points.append((cx + math.cos(ang) * 4.2 * s, cy + math.sin(ang) * 4.2 * s))
         _draw_polyline_2d(shader, ring_points, (1.0, 1.0, 1.0, 1.0))
         _draw_tri_2d(shader,
-            (cx + 4.2, cy + 0.6), (cx + 4.2, cy - 1.8), (cx + 6.2, cy - 0.6),
+            (cx + 4.2 * s, cy + 0.6 * s), (cx + 4.2 * s, cy - 1.8 * s), (cx + 6.2 * s, cy - 0.6 * s),
             (1.0, 1.0, 1.0, 1.0))
     elif kind == 1:
         # object origin: crosshair
-        _draw_line_2d(shader, (cx - 5, cy), (cx + 5, cy), (1.0, 1.0, 1.0, 1.0))
-        _draw_line_2d(shader, (cx, cy - 5), (cx, cy + 5), (1.0, 1.0, 1.0, 1.0))
+        _draw_line_2d(shader, (cx - 5 * s, cy), (cx + 5 * s, cy), (1.0, 1.0, 1.0, 1.0))
+        _draw_line_2d(shader, (cx, cy - 5 * s), (cx, cy + 5 * s), (1.0, 1.0, 1.0, 1.0))
     else:
         # object center: small filled dot
-        _draw_filled_circle_2d(shader, (cx, cy), 2.8, (1.0, 1.0, 1.0, 1.0), segments=12)
+        _draw_filled_circle_2d(shader, (cx, cy), 2.8 * s, (1.0, 1.0, 1.0, 1.0), segments=12)
 
 
 def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
@@ -2289,10 +2309,11 @@ def draw_move_mode_gizmo():
 
     # three gizmo buttons above the pivot
     try:
+        btn_size = _button_size(context)
         for btn in range(3):
             bx, by = _gizmo_button_positions(context, origin_screen)[btn]
             btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
-            _draw_button_icon(shader, bx, by, btn, btn_hover)
+            _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size)
     except Exception:
         pass
 
