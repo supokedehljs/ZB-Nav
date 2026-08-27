@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 14),
+    "version": (1, 15, 15),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -1921,11 +1921,15 @@ def draw_move_mode_gizmo():
             other1 = axes[(axis + 1) % 3]
             other2 = axes[(axis + 2) % 3]
             band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
+            view_dir = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
             inner_points = []
             outer_points = []
             for t in range(GIZMO_RING_SEGMENTS + 1):
                 ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
                 dir_vec = other1 * math.cos(ang) + other2 * math.sin(ang)
+                # only draw the camera-facing (front) half of the tube
+                if dir_vec.dot(view_dir) > 0:
+                    continue
                 si = _to_screen(context, origin + dir_vec * (radius - band_world))
                 so = _to_screen(context, origin + dir_vec * (radius + band_world))
                 if si and so:
