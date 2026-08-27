@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 17),
+    "version": (1, 15, 18),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -475,7 +475,6 @@ GIZMO_MOVE_TRI_BASE = 0.8
 GIZMO_MOVE_TRI_HALF_WID = 10.0
 GIZMO_SCALE_RECT_LEN = 26.0
 GIZMO_SCALE_RECT_WID = 16.0
-GIZMO_SCALE_BULGE_RADIUS = 11.0
 GIZMO_RING_BAND_PX = 2.0
 GIZMO_RING_TUBE_W = 3.0
 GIZMO_RING_TUBE_H = 7.0
@@ -1811,21 +1810,6 @@ def _draw_tri_2d(shader, a, b, c, color):
     batch.draw(shader)
 
 
-def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
-    cx, cy = center
-    verts = []
-    for i in range(segments):
-        a1 = 2.0 * math.pi * i / segments
-        a2 = 2.0 * math.pi * (i + 1) / segments
-        verts.append((cx, cy))
-        verts.append((cx + math.cos(a1) * radius, cy + math.sin(a1) * radius))
-        verts.append((cx + math.cos(a2) * radius, cy + math.sin(a2) * radius))
-    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
-
-
 def _draw_tri_along_axis(shader, apex, base, color, half_width):
     dx = base[0] - apex[0]
     dy = base[1] - apex[1]
@@ -1835,6 +1819,23 @@ def _draw_tri_along_axis(shader, apex, base, color, half_width):
     left = (base[0] + px * half_width, base[1] + py * half_width)
     right = (base[0] - px * half_width, base[1] - py * half_width)
     _draw_tri_2d(shader, (apex[0], apex[1]), left, right, color)
+
+
+def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
+    dx, dy = axis_dir_screen
+    norm = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    half_a = along / 2.0
+    half_c = across / 2.0
+    corners = [
+        (center[0] - ux * half_a + px * half_c, center[1] - uy * half_a + py * half_c),
+        (center[0] + ux * half_a + px * half_c, center[1] + uy * half_a + py * half_c),
+        (center[0] + ux * half_a - px * half_c, center[1] + uy * half_a - py * half_c),
+        (center[0] - ux * half_a - px * half_c, center[1] - uy * half_a - py * half_c),
+    ]
+    _draw_tri_2d(shader, corners[0], corners[1], corners[2], color)
+    _draw_tri_2d(shader, corners[0], corners[2], corners[3], color)
 
 
 def _draw_ring_band_2d(shader, inner_points, outer_points, color):
@@ -1861,44 +1862,37 @@ def _draw_tube_band_2d(shader, context, origin, e1, e2, radius, tube_w, tube_h, 
     half_w = tube_w / 2.0
     half_h = tube_h / 2.0
     segments = 128
-    # outer wall (normal +e) and top wall (normal +n), back-face culled on the
-    # camera-facing half, so the ring reads as a clean "C" instead of a "D".
-    for face in range(2):
-        strip = []
-        for i in range(segments + 1):
-            ang = 2.0 * math.pi * i / segments
-            e = e1 * math.cos(ang) + e2 * math.sin(ang)
-            if e.dot(view_dir) > 0:
-                continue
-            c = origin + e * radius
-            if face == 0:
-                a = c + e * half_w + normal * half_h
-                b = c + e * half_w - normal * half_h
-            else:
-                if normal.dot(view_dir) > 0:
-                    continue
-                a = c + normal * half_h + e * half_w
-                b = c + normal * half_h - e * half_w
-            sa = _to_screen(context, a)
-            sb = _to_screen(context, b)
-            if sa and sb:
-                strip.append(((sa.x, sa.y), (sb.x, sb.y)))
-        if len(strip) < 2:
+    # only the outer wall of the camera-facing half, so it always reads as a
+    # clean "C" arc with no inner rim or chord.
+    strip = []
+    for i in range(segments + 1):
+        ang = 2.0 * math.pi * i / segments
+        e = e1 * math.cos(ang) + e2 * math.sin(ang)
+        if e.dot(view_dir) > 0:
             continue
-        verts = []
-        for i in range(len(strip) - 1):
-            a1, a2 = strip[i]
-            b1, b2 = strip[i + 1]
-            verts.append(a1)
-            verts.append(a2)
-            verts.append(b2)
-            verts.append(a1)
-            verts.append(b2)
-            verts.append(b1)
-        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", color)
-        batch.draw(shader)
+        c = origin + e * radius
+        a = c + e * half_w + normal * half_h
+        b = c + e * half_w - normal * half_h
+        sa = _to_screen(context, a)
+        sb = _to_screen(context, b)
+        if sa and sb:
+            strip.append(((sa.x, sa.y), (sb.x, sb.y)))
+    if len(strip) < 2:
+        return
+    verts = []
+    for i in range(len(strip) - 1):
+        a1, a2 = strip[i]
+        b1, b2 = strip[i + 1]
+        verts.append(a1)
+        verts.append(a2)
+        verts.append(b2)
+        verts.append(a1)
+        verts.append(b2)
+        verts.append(b1)
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
 
 
 def draw_move_mode_gizmo():
@@ -1953,19 +1947,14 @@ def draw_move_mode_gizmo():
                     GIZMO_MOVE_TRI_HALF_WID,
                 )
 
-            if mid_screen:
-                # smooth ellipsoid bulge integrated into the axis line
-                _draw_filled_circle_2d(
+            if mid_screen and tip_screen and origin_screen:
+                _draw_rect_along_axis(
                     shader,
                     (mid_screen.x, mid_screen.y),
-                    GIZMO_SCALE_BULGE_RADIUS,
+                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
                     accent(color, "scale"),
-                )
-                _draw_filled_circle_2d(
-                    shader,
-                    (mid_screen.x, mid_screen.y),
-                    GIZMO_SCALE_BULGE_RADIUS * 0.45,
-                    (1.0, 1.0, 1.0, 0.9),
+                    GIZMO_SCALE_RECT_LEN,
+                    GIZMO_SCALE_RECT_WID,
                 )
 
             radius = length * GIZMO_RING_RADIUS
@@ -1973,9 +1962,7 @@ def draw_move_mode_gizmo():
             other2 = axes[(axis + 2) % 3]
             view_dir = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
             ring_color = accent(color, "rotate")
-            ring_color = (ring_color[0], ring_color[1], ring_color[2], 0.6)
-            if hover and hover[1] == axis and hover[0] == "rotate":
-                ring_color = (1.0, 1.0, 1.0, 1.0)
+            ring_color = (ring_color[0], ring_color[1], ring_color[2], 1.0)
             _draw_tube_band_2d(
                 shader,
                 context,
@@ -2008,9 +1995,7 @@ def draw_move_mode_gizmo():
                 inner_points.append((si.x, si.y))
                 outer_points.append((so.x, so.y))
         if len(inner_points) >= 3:
-            outer_color = (1.0, 1.0, 1.0, 0.35)
-            if hover and hover[0] == "view_rotate":
-                outer_color = (1.0, 1.0, 1.0, 1.0)
+            outer_color = (1.0, 1.0, 1.0, 1.0)
             _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
         # four corner triangles: translate in the view plane (squat, farther out)
@@ -2030,7 +2015,7 @@ def draw_move_mode_gizmo():
             rnorm = math.hypot(rx, ry) or 1.0
             dx, dy = rx / rnorm, ry / rnorm
             px, py = -dy, dx
-            corner_color = (1.0, 1.0, 1.0, 0.8)
+            corner_color = (1.0, 1.0, 1.0, 1.0)
             if hover and hover[0] == "view_move" and hover[1] == corner:
                 corner_color = (1.0, 1.0, 1.0, 1.0)
             apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
@@ -2040,18 +2025,9 @@ def draw_move_mode_gizmo():
     except Exception:
         pass
 
-    # center square: uniform scale (with diagonal reference line)
+    # center square: uniform scale (opaque)
     try:
-        diag = mathutils.Vector((1, -1)).normalized()
-        span = GIZMO_PIXEL_SIZE * 1.25
-        _draw_line_2d(shader,
-            (origin_screen.x - diag.x * span, origin_screen.y - diag.y * span),
-            (origin_screen.x + diag.x * span, origin_screen.y + diag.y * span),
-            (1.0, 1.0, 1.0, 0.15),
-        )
-        center_color = (1.0, 1.0, 1.0, 0.9)
-        if hover and hover[0] == "scale_all":
-            center_color = (1.0, 1.0, 1.0, 1.0)
+        center_color = (1.0, 1.0, 1.0, 1.0)
         half = GIZMO_CENTER_SQUARE_HALF
         cx, cy = origin_screen.x, origin_screen.y
         verts = [
