@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 23),
+    "version": (1, 15, 24),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -14,7 +14,7 @@ import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import FloatProperty, PointerProperty
+from bpy.props import FloatProperty, FloatVectorProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -466,6 +466,15 @@ def _lasso_covers_object(context, points):
 
 MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
 
+
+def _axis_color(context, axis):
+    prefs = get_preferences(context)
+    if prefs:
+        prop = getattr(prefs, ("axis_color_x", "axis_color_y", "axis_color_z")[axis], None)
+        if prop is not None:
+            return (prop[0], prop[1], prop[2])
+    return MOVE_AXIS_COLORS[axis]
+
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
 GIZMO_RING_RADIUS = 0.7
@@ -711,9 +720,9 @@ def _move_mode_pick(context, mouse_x, mouse_y):
         d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
         candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
 
-        # three gizmo buttons below the pivot
+        # three gizmo buttons above the pivot
         for btn in range(3):
-            bx, by = _gizmo_button_positions(origin_screen)[btn]
+            bx, by = _gizmo_button_positions(context, origin_screen)[btn]
             d = math.hypot(mouse_x - bx, mouse_y - by)
             candidates.append((d - GIZMO_BUTTON_RADIUS, "gizmo_button", btn))
 
@@ -1459,12 +1468,35 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
+    axis_color_x: FloatVectorProperty(
+        name="X 轴颜色",
+        description="控制轴 X 轴颜色",
+        default=(1.0, 0.15, 0.15),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+    axis_color_y: FloatVectorProperty(
+        name="Y 轴颜色",
+        description="控制轴 Y 轴颜色",
+        default=(0.15, 1.0, 0.2),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+    axis_color_z: FloatVectorProperty(
+        name="Z 轴颜色",
+        description="控制轴 Z 轴颜色",
+        default=(0.2, 0.5, 1.0),
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "pan_sensitivity")
         layout.prop(self, "zoom_sensitivity")
         layout.prop(self, "brush_size_sensitivity")
         layout.prop(self, "gizmo_size")
+        layout.label(text="控制轴颜色")
+        layout.prop(self, "axis_color_x")
+        layout.prop(self, "axis_color_y")
+        layout.prop(self, "axis_color_z")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1644,6 +1676,10 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
         prefs = get_preferences(context)
         if prefs:
             move_box.prop(prefs, "gizmo_size", text="控制轴大小")
+            color_row = move_box.row(align=True)
+            color_row.prop(prefs, "axis_color_x")
+            color_row.prop(prefs, "axis_color_y")
+            color_row.prop(prefs, "axis_color_z")
         move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
         move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
 
@@ -1934,8 +1970,9 @@ def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
     batch.draw(shader)
 
 
-def _gizmo_button_positions(origin_screen):
-    base_y = origin_screen.y - GIZMO_BUTTON_Y_OFFSET
+def _gizmo_button_positions(context, origin_screen):
+    length = _gizmo_length(context)
+    base_y = origin_screen.y + length * 1.15
     return [
         (origin_screen.x - GIZMO_BUTTON_SPACING, base_y),
         (origin_screen.x, base_y),
@@ -2081,7 +2118,7 @@ def draw_move_mode_gizmo():
 
     for axis in range(3):
         try:
-            color = MOVE_AXIS_COLORS[axis]
+            color = _axis_color(context, axis)
             axis_dir = axes[axis]
 
             tip_screen = _to_screen(context, origin + axis_dir * length)
@@ -2194,10 +2231,10 @@ def draw_move_mode_gizmo():
     except Exception:
         pass
 
-    # three gizmo buttons below the pivot
+    # three gizmo buttons above the pivot
     try:
         for btn in range(3):
-            bx, by = _gizmo_button_positions(origin_screen)[btn]
+            bx, by = _gizmo_button_positions(context, origin_screen)[btn]
             btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
             _draw_button_icon(shader, bx, by, btn, btn_hover)
     except Exception:
