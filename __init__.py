@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 22),
+    "version": (1, 15, 23),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -14,7 +14,6 @@ import blf
 import bpy
 import gpu
 import mathutils
-import numpy as np
 from bpy.props import FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
@@ -483,6 +482,9 @@ GIZMO_CENTER_SQUARE_HALF = 8.0
 GIZMO_CORNER_RADIUS = 0.98
 GIZMO_CORNER_TRI_HEIGHT = 22.0
 GIZMO_CORNER_TRI_HALF_WID = 22.0
+GIZMO_BUTTON_RADIUS = 9.0
+GIZMO_BUTTON_SPACING = 20.0
+GIZMO_BUTTON_Y_OFFSET = 30.0
 
 
 def _pivot_to_list(matrix):
@@ -552,49 +554,15 @@ def _scale_matrix_about_axis(origin, axis, factor):
 
 
 def _transform_mesh_in_world(obj, world_transform):
-    """Transform mesh vertices in world space without changing object origin.
-
-    Vertices covered by a sculpt mask are kept in place; only unmasked
-    vertices are transformed (blended by the mask value).
-    """
+    """Transform mesh vertices in world space without changing object origin."""
     object_to_world = obj.matrix_world.copy()
-    local_transform = object_to_world.inverted_safe() @ world_transform @ object_to_world
-    mesh = obj.data
-
-    mask_attr = None
-    if hasattr(mesh, "attributes"):
-        mask_attr = mesh.attributes.get("mask")
-    if (
-        mask_attr is None
-        or mask_attr.data_type != "FLOAT"
-        or mask_attr.domain != "POINT"
-    ):
-        mesh.transform(local_transform)
-        mesh.update()
-        return
-
-    verts = mesh.vertices
-    n = len(verts)
-    if n == 0:
-        return
-
-    co = np.zeros(n * 3, dtype=np.float32)
-    verts.foreach_get("co", co)
-    co3 = co.reshape((n, 3))
-
-    mask_vals = np.zeros(n, dtype=np.float32)
-    mask_attr.data.foreach_get("value", mask_vals)
-
-    linear = np.array(local_transform.to_3x3(), dtype=np.float32)
-    translation = np.array(
-        (local_transform[0][3], local_transform[1][3], local_transform[2][3]),
-        dtype=np.float32,
+    local_transform = (
+        object_to_world.inverted_safe()
+        @ world_transform
+        @ object_to_world
     )
-    transformed = co3 @ linear.T + translation
-    weight = mask_vals.reshape((n, 1))
-    final = co3 * weight + transformed * (1.0 - weight)
-    verts.foreach_set("co", final.ravel())
-    mesh.update()
+    obj.data.transform(local_transform)
+    obj.data.update()
 
 
 def _gizmo_world_axes(context):
@@ -742,6 +710,12 @@ def _move_mode_pick(context, mouse_x, mouse_y):
     if origin_screen:
         d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
         candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
+
+        # three gizmo buttons below the pivot
+        for btn in range(3):
+            bx, by = _gizmo_button_positions(origin_screen)[btn]
+            d = math.hypot(mouse_x - bx, mouse_y - by)
+            candidates.append((d - GIZMO_BUTTON_RADIUS, "gizmo_button", btn))
 
     candidates.sort(key=lambda item: item[0])
     if candidates and candidates[0][0] < 6.0:
@@ -899,11 +873,45 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             context.area.tag_redraw()
         return {"RUNNING_MODAL"}
 
+    def _do_button(self, context, button_index):
+        obj = context.active_object
+        if not obj:
+            return {"CANCELLED"}
+        matrix = _get_gizmo_matrix(context)
+        if matrix is None:
+            return {"CANCELLED"}
+        try:
+            bpy.ops.ed.undo_push(message="Gizmo Button")
+        except (RuntimeError, AttributeError):
+            pass
+        if button_index == 0:
+            # reset control axis rotation to zero, keep position
+            loc, _rot, scale = matrix.decompose()
+            matrix = mathutils.Matrix.LocRotScale(loc, mathutils.Quaternion(), scale)
+            _set_gizmo_matrix(obj.name, matrix)
+        elif button_index == 1:
+            # move to object origin, rotation aligned to origin
+            _set_gizmo_matrix(obj.name, obj.matrix_world.copy())
+        else:
+            # move to object center, keep rotation
+            center = mathutils.Vector((0.0, 0.0, 0.0))
+            for c in obj.bound_box:
+                center += obj.matrix_world @ mathutils.Vector(c)
+            center /= 8.0
+            loc, rot, scale = matrix.decompose()
+            matrix = mathutils.Matrix.LocRotScale(center, rot, scale)
+            _set_gizmo_matrix(obj.name, matrix)
+        if context.area:
+            context.area.tag_redraw()
+        return {"CANCELLED"}
+
     def invoke(self, context, event):
+        handle = _move_mode_pick(
+            context, event.mouse_region_x, event.mouse_region_y,
+        )
+        if handle is not None and handle[0] == "gizmo_button":
+            return self._do_button(context, handle[1])
         if event.alt:
-            handle = _move_mode_pick(
-                context, event.mouse_region_x, event.mouse_region_y,
-            )
             if handle is not None:
                 return self._start_pivot_transform(context, event, handle)
             return self._start_reposition(context, event)
@@ -911,9 +919,6 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         obj = context.active_object
         if not obj or obj.type != "MESH":
             return {"CANCELLED"}
-        handle = _move_mode_pick(
-            context, event.mouse_region_x, event.mouse_region_y,
-        )
         if handle is None:
             MOVE_MODE_HOVER = None
             return {"CANCELLED"}
@@ -1914,6 +1919,52 @@ def _draw_tri_along_axis(shader, apex, base, color, half_width):
     _draw_tri_2d(shader, (apex[0], apex[1]), left, right, color)
 
 
+def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
+    cx, cy = center
+    verts = []
+    for i in range(segments):
+        a1 = 2.0 * math.pi * i / segments
+        a2 = 2.0 * math.pi * (i + 1) / segments
+        verts.append((cx, cy))
+        verts.append((cx + math.cos(a1) * radius, cy + math.sin(a1) * radius))
+        verts.append((cx + math.cos(a2) * radius, cy + math.sin(a2) * radius))
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _gizmo_button_positions(origin_screen):
+    base_y = origin_screen.y - GIZMO_BUTTON_Y_OFFSET
+    return [
+        (origin_screen.x - GIZMO_BUTTON_SPACING, base_y),
+        (origin_screen.x, base_y),
+        (origin_screen.x + GIZMO_BUTTON_SPACING, base_y),
+    ]
+
+
+def _draw_button_icon(shader, cx, cy, kind, hover):
+    bg = (0.15, 0.15, 0.2, 1.0) if not hover else (0.35, 0.35, 0.45, 1.0)
+    _draw_filled_circle_2d(shader, (cx, cy), GIZMO_BUTTON_RADIUS, bg)
+    if kind == 0:
+        # reset rotation: an arc with an arrowhead
+        ring_points = []
+        for t in range(25):
+            ang = -math.pi * 0.75 + (math.pi * 1.5) * t / 24
+            ring_points.append((cx + math.cos(ang) * 4.2, cy + math.sin(ang) * 4.2))
+        _draw_polyline_2d(shader, ring_points, (1.0, 1.0, 1.0, 1.0))
+        _draw_tri_2d(shader,
+            (cx + 4.2, cy + 0.6), (cx + 4.2, cy - 1.8), (cx + 6.2, cy - 0.6),
+            (1.0, 1.0, 1.0, 1.0))
+    elif kind == 1:
+        # object origin: crosshair
+        _draw_line_2d(shader, (cx - 5, cy), (cx + 5, cy), (1.0, 1.0, 1.0, 1.0))
+        _draw_line_2d(shader, (cx, cy - 5), (cx, cy + 5), (1.0, 1.0, 1.0, 1.0))
+    else:
+        # object center: small filled dot
+        _draw_filled_circle_2d(shader, (cx, cy), 2.8, (1.0, 1.0, 1.0, 1.0), segments=12)
+
+
 def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
     dx, dy = axis_dir_screen
     norm = math.hypot(dx, dy) or 1.0
@@ -2140,6 +2191,15 @@ def draw_move_mode_gizmo():
         shader.bind()
         shader.uniform_float("color", center_color)
         batch.draw(shader)
+    except Exception:
+        pass
+
+    # three gizmo buttons below the pivot
+    try:
+        for btn in range(3):
+            bx, by = _gizmo_button_positions(origin_screen)[btn]
+            btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
+            _draw_button_icon(shader, bx, by, btn, btn_hover)
     except Exception:
         pass
 
