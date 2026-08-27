@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 28),
+    "version": (1, 15, 29),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -500,9 +500,14 @@ GIZMO_CENTER_SQUARE_HALF = 8.0
 GIZMO_CORNER_RADIUS = 0.98
 GIZMO_CORNER_TRI_HEIGHT = 22.0
 GIZMO_CORNER_TRI_HALF_WID = 22.0
-GIZMO_BUTTON_RADIUS = 9.0
-GIZMO_BUTTON_SPACING = 20.0
+GIZMO_BUTTON_RADIUS = 10.0
+GIZMO_BUTTON_SPACING = 26.0
 GIZMO_BUTTON_Y_OFFSET = 30.0
+GIZMO_BUTTON_TOOLTIPS = (
+    ("重置轴向", "恢复世界方向，保留轴心位置"),
+    ("回到物体原点", "轴心位置和方向匹配物体原点"),
+    ("回到网格中心", "移动轴心到网格包围盒中心"),
+)
 
 
 def _pivot_to_list(matrix):
@@ -571,15 +576,45 @@ def _scale_matrix_about_axis(origin, axis, factor):
     )
 
 
+def _mesh_vertex_mask(obj, vertex_index):
+    """Return Blender's sculpt mask value for one mesh vertex."""
+    if not obj or not obj.data:
+        return 0.0
+    mask_layer = obj.data.attributes.get(".sculpt_mask")
+    if mask_layer and vertex_index < len(mask_layer.data):
+        try:
+            return max(0.0, min(1.0, float(mask_layer.data[vertex_index].value)))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    return 0.0
+
+
+def _unmasked_world_center(obj):
+    """Return the center of vertices that are not sculpt-masked."""
+    points = [
+        obj.matrix_world @ vertex.co
+        for vertex in obj.data.vertices
+        if _mesh_vertex_mask(obj, vertex.index) < 0.999
+    ]
+    if not points:
+        return obj.matrix_world.translation.copy()
+    center = mathutils.Vector((0.0, 0.0, 0.0))
+    for point in points:
+        center += point
+    return center / len(points)
+
+
 def _transform_mesh_in_world(obj, world_transform):
-    """Transform mesh vertices in world space without changing object origin."""
+    """Transform only unmasked mesh vertices in world space."""
     object_to_world = obj.matrix_world.copy()
     local_transform = (
         object_to_world.inverted_safe()
         @ world_transform
         @ object_to_world
     )
-    obj.data.transform(local_transform)
+    for vertex in obj.data.vertices:
+        if _mesh_vertex_mask(obj, vertex.index) < 0.999:
+            vertex.co = local_transform @ vertex.co
     obj.data.update()
 
 
@@ -912,11 +947,8 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             # move to object origin, rotation aligned to origin
             _set_gizmo_matrix(obj.name, obj.matrix_world.copy())
         else:
-            # move to object center, keep rotation
-            center = mathutils.Vector((0.0, 0.0, 0.0))
-            for c in obj.bound_box:
-                center += obj.matrix_world @ mathutils.Vector(c)
-            center /= 8.0
+            # move to the center of the visible/unmasked mesh
+            center = _unmasked_world_center(obj)
             loc, rot, scale = matrix.decompose()
             matrix = mathutils.Matrix.LocRotScale(center, rot, scale)
             _set_gizmo_matrix(obj.name, matrix)
@@ -1232,6 +1264,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
 
     _lasso_active = False
     _lasso_points = []
+    _lasso_subtract = False
     _native_mask_active = False
 
     @classmethod
@@ -1243,10 +1276,17 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         CTRL_DIAGNOSTIC_RUNNING = True
         self._lasso_active = False
         self._lasso_points = []
+        self._lasso_subtract = False
         self._native_mask_active = False
         CTRL_LASSO_POINTS = []
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
+
+    def _push_mask_undo(self, message):
+        try:
+            bpy.ops.ed.undo_push(message=message)
+        except (RuntimeError, AttributeError):
+            pass
 
     def _finish(self, context):
         global CTRL_DIAGNOSTIC_RUNNING, CTRL_LASSO_POINTS
@@ -1260,12 +1300,15 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         global CTRL_HIT_STATUS
         try:
             if _is_lasso_click(points):
-                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=1.0)
-                CTRL_HIT_STATUS = "空白点击：已填充全部遮罩"
+                self._push_mask_undo("ZB-Nav 反转遮罩")
+                bpy.ops.paint.mask_flood_fill(mode="INVERT", value=0.0)
+                CTRL_HIT_STATUS = "已反转全部遮罩"
             elif not _lasso_covers_object(context, points):
+                self._push_mask_undo("ZB-Nav 清除遮罩")
                 bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.0)
                 CTRL_HIT_STATUS = "空白套索未遮罩到物体：已清除全部遮罩"
             else:
+                self._push_mask_undo("ZB-Nav 套索遮罩")
                 bpy.ops.paint.mask_lasso_gesture(
                     path=[
                         {
@@ -1275,9 +1318,9 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                         }
                         for index, (px, py) in enumerate(points)
                     ],
-                    value=1.0,
+                    value=0.0 if self._lasso_subtract else 1.0,
                 )
-                CTRL_HIT_STATUS = "空白套索：已对物体应用遮罩"
+                CTRL_HIT_STATUS = "套索：已减选遮罩" if self._lasso_subtract else "套索：已添加遮罩"
         except Exception as exc:
             CTRL_HIT_STATUS = f"遮罩操作失败: {exc}"
         if context.area:
@@ -1292,6 +1335,15 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
             self._lasso_active = False
             self._lasso_points = []
             CTRL_LASSO_POINTS = []
+            if event.type == "MOUSEMOVE":
+                global MOVE_MODE_HOVER
+                hover = _move_mode_pick(
+                    context, event.mouse_region_x, event.mouse_region_y
+                )
+                if hover != MOVE_MODE_HOVER:
+                    MOVE_MODE_HOVER = hover
+                    if context.area:
+                        context.area.tag_redraw()
             return {"PASS_THROUGH"}
 
         # A native mask stroke started on the model surface; let it run.
@@ -1348,9 +1400,10 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
             )
             if hit_object is None:
                 self._lasso_active = True
+                self._lasso_subtract = event.alt
                 self._lasso_points = [(event.mouse_region_x, event.mouse_region_y)]
                 CTRL_LASSO_POINTS = list(self._lasso_points)
-                CTRL_HIT_STATUS = "空白命中：拖动画套索，或直接点击填充全部遮罩"
+                CTRL_HIT_STATUS = "空白命中：Alt 减选遮罩" if event.alt else "空白命中：添加遮罩"
                 if context.area:
                     context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
@@ -1359,6 +1412,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 # the native sculpt mask brush stroke.
                 self._native_mask_active = True
                 try:
+                    self._push_mask_undo("ZB-Nav 笔刷遮罩")
                     bpy.ops.sculpt.brush_stroke(
                         "INVOKE_DEFAULT",
                         brush_toggle="MASK",
@@ -1530,7 +1584,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     gizmo_button_spacing: FloatProperty(
         name="按钮间距",
         description="三个图标按钮之间的水平间距（像素）",
-        default=20.0,
+        default=30.0,
         min=8.0,
         max=100.0,
         step=10,
@@ -1539,7 +1593,7 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     gizmo_button_size: FloatProperty(
         name="按钮大小",
         description="三个图标按钮的半径（像素）",
-        default=9.0,
+        default=30.0,
         min=5.0,
         max=30.0,
         step=10,
@@ -2042,6 +2096,38 @@ def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
     batch.draw(shader)
 
 
+def _draw_rounded_rect_2d(shader, x1, y1, x2, y2, radius, color, segments=5):
+    radius = max(0.0, min(radius, abs(x2 - x1) * 0.5, abs(y2 - y1) * 0.5))
+    centers = (
+        (x2 - radius, y2 - radius, 0.0),
+        (x1 + radius, y2 - radius, math.pi * 0.5),
+        (x1 + radius, y1 + radius, math.pi),
+        (x2 - radius, y1 + radius, math.pi * 1.5),
+    )
+    outline = []
+    for cx, cy, start in centers:
+        for step in range(segments + 1):
+            angle = start + (math.pi * 0.5) * step / segments
+            outline.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+    verts = []
+    center = ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+    for index, point in enumerate(outline):
+        verts.extend((center, point, outline[(index + 1) % len(outline)]))
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=32):
+    points = []
+    for step in range(segments + 1):
+        angle = 2.0 * math.pi * step / segments
+        points.append((center[0] + math.cos(angle) * radius, center[1] + math.sin(angle) * radius))
+    gpu.state.line_width_set(width)
+    _draw_polyline_2d(shader, points, color)
+
+
 def _gizmo_button_positions(context, origin_screen):
     prefs = get_preferences(context)
     gizmo_size = prefs.gizmo_size if prefs else 1.0
@@ -2069,45 +2155,64 @@ def _button_color(context):
 
 
 def _draw_button_icon(shader, cx, cy, kind, hover, size, color):
-    s = size / 9.0
-    c = (1.0, 1.0, 1.0, 1.0) if hover else (color[0], color[1], color[2], 1.0)
-    dark = (0.0, 0.0, 0.0, 0.75)
+    """Draw one simple borderless icon with smooth line rendering."""
+    s = size / 10.0
+    icon = (1.0, 1.0, 1.0, 1.0) if hover else (color[0], color[1], color[2], 1.0)
+    try:
+        gpu.state.line_smooth_set(True)
+    except (AttributeError, RuntimeError):
+        pass
+
     if kind == 0:
-        # reset rotation: outlined arc with an arrowhead
-        ring_points = []
-        for t in range(25):
-            ang = -math.pi * 0.75 + (math.pi * 1.5) * t / 24
-            ring_points.append((cx + math.cos(ang) * 4.5 * s, cy + math.sin(ang) * 4.5 * s))
-        gpu.state.line_width_set(3.5 * s)
-        _draw_polyline_2d(shader, ring_points, dark)
-        gpu.state.line_width_set(2.0 * s)
-        _draw_polyline_2d(shader, ring_points, c)
-        _draw_tri_2d(shader,
-            (cx + 4.5 * s, cy + 0.6 * s), (cx + 4.5 * s, cy - 1.8 * s), (cx + 6.5 * s, cy - 0.6 * s),
-            dark)
-        _draw_tri_2d(shader,
-            (cx + 4.5 * s, cy + 0.4 * s), (cx + 4.5 * s, cy - 1.6 * s), (cx + 6.3 * s, cy - 0.6 * s),
-            c)
+        # Reset axis: one simple circular arrow.
+        points = []
+        for step in range(20):
+            angle = math.radians(45.0) + math.radians(275.0) * step / 19.0
+            points.append((cx + math.cos(angle) * 6.0 * s, cy + math.sin(angle) * 6.0 * s))
+        gpu.state.line_width_set(1.8 * s)
+        _draw_polyline_2d(shader, points, icon)
+        ex, ey = points[-1]
+        _draw_tri_2d(shader, (ex, ey), (ex - 4.0 * s, ey + 0.5 * s), (ex - 0.8 * s, ey - 3.0 * s), icon)
     elif kind == 1:
-        # object origin: outlined crosshair
-        for off in (-1.2 * s, 1.2 * s):
-            gpu.state.line_width_set(3.5 * s)
-            _draw_line_2d(shader, (cx - 5 * s + off, cy), (cx + 5 * s + off, cy), dark)
-            _draw_line_2d(shader, (cx, cy - 5 * s + off), (cx, cy + 5 * s + off), dark)
-        gpu.state.line_width_set(2.0 * s)
-        _draw_line_2d(shader, (cx - 5 * s, cy), (cx + 5 * s, cy), c)
-        _draw_line_2d(shader, (cx, cy - 5 * s), (cx, cy + 5 * s), c)
+        # Object origin: minimal crosshair.
+        gpu.state.line_width_set(1.8 * s)
+        _draw_line_2d(shader, (cx - 7.0 * s, cy), (cx + 7.0 * s, cy), icon)
+        _draw_line_2d(shader, (cx, cy - 7.0 * s), (cx, cy + 7.0 * s), icon)
+        _draw_filled_circle_2d(shader, (cx, cy), 1.5 * s, icon, segments=12)
     else:
-        # object center: outlined circle ring
-        pts = []
-        for t in range(25):
-            ang = 2.0 * math.pi * t / 24
-            pts.append((cx + math.cos(ang) * 4.0 * s, cy + math.sin(ang) * 4.0 * s))
-        gpu.state.line_width_set(3.5 * s)
-        _draw_polyline_2d(shader, pts + [pts[0]], dark)
-        gpu.state.line_width_set(2.0 * s)
-        _draw_polyline_2d(shader, pts + [pts[0]], c)
+        # Mesh center: inverted address/location pin.
+        radius = 5.5 * s
+        curve = []
+        for step in range(49):
+            angle = math.pi - math.pi * step / 48.0
+            curve.append((cx + math.cos(angle) * radius, cy + 1.0 * s + math.sin(angle) * radius))
+        outline = curve + [(cx, cy - 7.0 * s)]
+        gpu.state.line_width_set(1.8 * s)
+        _draw_polyline_2d(shader, outline + [outline[0]], icon)
+        _draw_circle_outline_2d(shader, (cx, cy + 1.0 * s), 1.8 * s, icon, 1.5 * s, 16)
+
     gpu.state.line_width_set(1.0)
+    try:
+        gpu.state.line_smooth_set(False)
+    except (AttributeError, RuntimeError):
+        pass
+def _draw_gizmo_button_tooltip(shader, context, button_index, bx, by, button_size):
+    """Draw a small, plain text-only tooltip."""
+    region = context.region
+    if not region or not (0 <= button_index < len(GIZMO_BUTTON_TOOLTIPS)):
+        return
+    title, detail = GIZMO_BUTTON_TOOLTIPS[button_index]
+    font_id = 0
+    x = min(max(bx + button_size + 8.0, 8.0), max(region.width - 180.0, 8.0))
+    y = by + 5.0
+    blf.size(font_id, 12)
+    blf.color(font_id, 1.0, 1.0, 1.0, 0.95)
+    blf.position(font_id, x, y, 0)
+    blf.draw(font_id, title)
+    blf.size(font_id, 10)
+    blf.color(font_id, 0.72, 0.76, 0.82, 0.9)
+    blf.position(font_id, x, y - 15.0, 0)
+    blf.draw(font_id, detail)
 
 
 def _draw_rect_along_axis(shader, center, axis_dir_screen, color, along, across):
@@ -2325,6 +2430,20 @@ def draw_move_mode_gizmo():
     except Exception:
         pass
 
+    # redraw the three translation arrows last so the view ring never covers them
+    for axis in range(3):
+        try:
+            color = _axis_color(context, axis)
+            axis_dir = axes[axis]
+            tip_screen = _to_screen(context, origin + axis_dir * length)
+            base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
+            if tip_screen and base_screen:
+                arrow_color = accent(color, "move")
+                _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), arrow_color)
+                _draw_tri_along_axis(shader, (tip_screen.x, tip_screen.y), (base_screen.x, base_screen.y), arrow_color, GIZMO_MOVE_TRI_HALF_WID)
+        except Exception:
+            pass
+
     # center square: uniform scale (opaque)
     try:
         center_color = (1.0, 1.0, 1.0, 1.0)
@@ -2345,10 +2464,17 @@ def draw_move_mode_gizmo():
     try:
         btn_size = _button_size(context)
         btn_color = _button_color(context)
+        button_positions = _gizmo_button_positions(context, origin_screen)
+        hovered_button = None
         for btn in range(3):
-            bx, by = _gizmo_button_positions(context, origin_screen)[btn]
+            bx, by = button_positions[btn]
             btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
+            if btn_hover:
+                hovered_button = (btn, bx, by)
             _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size, btn_color)
+        if hovered_button is not None:
+            btn, bx, by = hovered_button
+            _draw_gizmo_button_tooltip(shader, context, btn, bx, by, btn_size)
     except Exception:
         pass
 
@@ -2367,13 +2493,22 @@ def draw_ctrl_hit_status():
     if CTRL_LASSO_POINTS:
         shader = gpu.shader.from_builtin("UNIFORM_COLOR")
         points = [(float(px), float(py)) for px, py in CTRL_LASSO_POINTS]
+        if len(points) >= 3:
+            fill_verts = []
+            for index in range(1, len(points) - 1):
+                fill_verts.extend((points[0], points[index], points[index + 1]))
+            fill_batch = batch_for_shader(shader, "TRIS", {"pos": fill_verts})
+            gpu.state.blend_set("ALPHA")
+            shader.bind()
+            shader.uniform_float("color", (0.0, 0.0, 0.0, 0.16))
+            fill_batch.draw(shader)
         if len(points) >= 2:
             vertices = points + [points[0]]
             batch = batch_for_shader(shader, "LINE_STRIP", {"pos": vertices})
             gpu.state.blend_set("ALPHA")
-            gpu.state.line_width_set(2.0)
+            gpu.state.line_width_set(1.5)
             shader.bind()
-            shader.uniform_float("color", (1.0, 1.0, 0.0, 0.9))
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.95))
             batch.draw(shader)
             gpu.state.line_width_set(1.0)
             gpu.state.blend_set("NONE")
