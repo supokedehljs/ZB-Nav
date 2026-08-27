@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 20),
+    "version": (1, 15, 21),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -484,19 +484,54 @@ GIZMO_CORNER_TRI_HEIGHT = 22.0
 GIZMO_CORNER_TRI_HALF_WID = 22.0
 
 
+def _pivot_to_list(matrix):
+    return [float(matrix[i][j]) for i in range(4) for j in range(4)]
+
+
+def _pivot_from_list(data):
+    m = mathutils.Matrix()
+    for i in range(4):
+        for j in range(4):
+            m[i][j] = data[i * 4 + j]
+    return m
+
+
 def _get_gizmo_matrix(context):
     global MOVE_GIZMO_PIVOT
     obj = context.active_object
     if not obj:
         return None
-    if MOVE_GIZMO_PIVOT is None or MOVE_GIZMO_PIVOT[0] != obj.name:
-        MOVE_GIZMO_PIVOT = (obj.name, obj.matrix_world.copy())
-    return MOVE_GIZMO_PIVOT[1]
+    # The pivot lives on the mesh data so it reverts together with the mesh
+    # when the user undoes a gizmo transform.
+    if obj.data and "zb_nav_pivot" in obj.data:
+        matrix = _pivot_from_list(obj.data["zb_nav_pivot"])
+        MOVE_GIZMO_PIVOT = (obj.name, matrix)
+        return matrix
+    if MOVE_GIZMO_PIVOT is not None and MOVE_GIZMO_PIVOT[0] == obj.name:
+        matrix = MOVE_GIZMO_PIVOT[1]
+        try:
+            obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
+        except Exception:
+            pass
+        return matrix
+    matrix = obj.matrix_world.copy()
+    MOVE_GIZMO_PIVOT = (obj.name, matrix)
+    try:
+        obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
+    except Exception:
+        pass
+    return matrix
 
 
 def _set_gizmo_matrix(obj_name, matrix):
     global MOVE_GIZMO_PIVOT
     MOVE_GIZMO_PIVOT = (obj_name, matrix.copy())
+    obj = bpy.data.objects.get(obj_name)
+    if obj and obj.data:
+        try:
+            obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
+        except Exception:
+            pass
 
 
 def _scale_matrix_about_axis(origin, axis, factor):
