@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 21),
+    "version": (1, 15, 22),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -14,6 +14,7 @@ import blf
 import bpy
 import gpu
 import mathutils
+import numpy as np
 from bpy.props import FloatProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
@@ -551,15 +552,49 @@ def _scale_matrix_about_axis(origin, axis, factor):
 
 
 def _transform_mesh_in_world(obj, world_transform):
-    """Transform mesh vertices in world space without changing object origin."""
+    """Transform mesh vertices in world space without changing object origin.
+
+    Vertices covered by a sculpt mask are kept in place; only unmasked
+    vertices are transformed (blended by the mask value).
+    """
     object_to_world = obj.matrix_world.copy()
-    local_transform = (
-        object_to_world.inverted_safe()
-        @ world_transform
-        @ object_to_world
+    local_transform = object_to_world.inverted_safe() @ world_transform @ object_to_world
+    mesh = obj.data
+
+    mask_attr = None
+    if hasattr(mesh, "attributes"):
+        mask_attr = mesh.attributes.get("mask")
+    if (
+        mask_attr is None
+        or mask_attr.data_type != "FLOAT"
+        or mask_attr.domain != "POINT"
+    ):
+        mesh.transform(local_transform)
+        mesh.update()
+        return
+
+    verts = mesh.vertices
+    n = len(verts)
+    if n == 0:
+        return
+
+    co = np.zeros(n * 3, dtype=np.float32)
+    verts.foreach_get("co", co)
+    co3 = co.reshape((n, 3))
+
+    mask_vals = np.zeros(n, dtype=np.float32)
+    mask_attr.data.foreach_get("value", mask_vals)
+
+    linear = np.array(local_transform.to_3x3(), dtype=np.float32)
+    translation = np.array(
+        (local_transform[0][3], local_transform[1][3], local_transform[2][3]),
+        dtype=np.float32,
     )
-    obj.data.transform(local_transform)
-    obj.data.update()
+    transformed = co3 @ linear.T + translation
+    weight = mask_vals.reshape((n, 1))
+    final = co3 * weight + transformed * (1.0 - weight)
+    verts.foreach_set("co", final.ravel())
+    mesh.update()
 
 
 def _gizmo_world_axes(context):
