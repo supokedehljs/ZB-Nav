@@ -464,7 +464,7 @@ def _lasso_covers_object(context, points):
     return False
 
 
-MOVE_AXIS_COLORS = ((1.0, 0.15, 0.15), (0.15, 1.0, 0.2), (0.2, 0.5, 1.0))
+MOVE_AXIS_COLORS = ((0.42, 0.055, 0.055), (0.055, 0.42, 0.08), (0.07, 0.18, 0.48))
 
 
 def _axis_color(context, axis):
@@ -475,14 +475,6 @@ def _axis_color(context, axis):
             return (prop[0], prop[1], prop[2])
     return MOVE_AXIS_COLORS[axis]
 
-
-def _pref_color3(context, name, fallback):
-    prefs = get_preferences(context)
-    if prefs:
-        prop = getattr(prefs, name, None)
-        if prop is not None:
-            return (prop[0], prop[1], prop[2])
-    return fallback
 
 GIZMO_PIXEL_SIZE = 115.0
 GIZMO_SCALE_POS = 0.35
@@ -640,9 +632,7 @@ def _gizmo_length(context):
     if not region or not region_3d:
         return 1.0
 
-    prefs = get_preferences(context)
-    size = prefs.gizmo_size if prefs else 1.0
-    target_pixels = GIZMO_PIXEL_SIZE * max(0.2, size)
+    target_pixels = GIZMO_PIXEL_SIZE
 
     right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
     a = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
@@ -661,6 +651,34 @@ def _to_screen(context, world_pos):
     if not region or not region_3d:
         return None
     return view3d_utils.location_3d_to_region_2d(region, region_3d, world_pos)
+
+
+def _axis_drag_angle(context, origin, axis, previous, current):
+    region = context.region
+    region_3d = context.region_data
+    if not region or not region_3d:
+        return 0.0
+
+    points = []
+    for coord in (previous, current):
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+        ray_direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+        denominator = axis.dot(ray_direction)
+        if abs(denominator) < 1e-6:
+            return 0.0
+        distance = axis.dot(origin - ray_origin) / denominator
+        points.append(ray_origin + ray_direction * distance)
+
+    previous_vector = points[0] - origin
+    current_vector = points[1] - origin
+    if previous_vector.length < 1e-6 or current_vector.length < 1e-6:
+        return 0.0
+    previous_vector.normalize()
+    current_vector.normalize()
+    return math.atan2(
+        axis.dot(previous_vector.cross(current_vector)),
+        previous_vector.dot(current_vector),
+    )
 
 
 def _dist_point_to_segment(px, py, ax, ay, bx, by):
@@ -1100,15 +1118,13 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
-                    prev_angle = math.atan2(
-                        self._last_y - origin_screen.y,
-                        self._last_x - origin_screen.x,
+                    angle = _axis_drag_angle(
+                        context,
+                        origin,
+                        axis_dir,
+                        (self._last_x, self._last_y),
+                        (event.mouse_region_x, event.mouse_region_y),
                     )
-                    cur_angle = math.atan2(
-                        event.mouse_region_y - origin_screen.y,
-                        event.mouse_region_x - origin_screen.x,
-                    )
-                    angle = -(cur_angle - prev_angle)
                     rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
                     translation = mathutils.Matrix.Translation(origin)
                     transform = translation @ rotation @ translation.inverted()
@@ -1176,15 +1192,13 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             elif kind == "rotate":
                 origin_screen = _to_screen(context, origin)
                 if origin_screen:
-                    prev_angle = math.atan2(
-                        self._last_y - origin_screen.y,
-                        self._last_x - origin_screen.x,
+                    angle = _axis_drag_angle(
+                        context,
+                        origin,
+                        axis_dir,
+                        (self._last_x, self._last_y),
+                        (event.mouse_region_x, event.mouse_region_y),
                     )
-                    cur_angle = math.atan2(
-                        event.mouse_region_y - origin_screen.y,
-                        event.mouse_region_x - origin_screen.x,
-                    )
-                    angle = -(cur_angle - prev_angle)
                     rotation = mathutils.Matrix.Rotation(angle, 4, axis_dir)
                     translation = mathutils.Matrix.Translation(origin)
                     matrix = matrix.copy()
@@ -1521,82 +1535,23 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
-    gizmo_size: FloatProperty(
-        name="控制轴大小",
-        description="移动模式中控制轴在视图里的显示大小",
-        default=1.0,
-        min=0.3,
-        max=3.0,
-        soft_min=0.5,
-        soft_max=2.5,
-        step=10,
-    )
-
     axis_color_x: FloatVectorProperty(
         name="X 轴颜色",
-        description="控制轴 X 轴颜色",
-        default=(1.0, 0.15, 0.15),
+        description="控制轴 X 轴颜色（保留设置，仅用于兼容已有颜色）",
+        default=(0.42, 0.055, 0.055),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
     axis_color_y: FloatVectorProperty(
         name="Y 轴颜色",
-        description="控制轴 Y 轴颜色",
-        default=(0.15, 1.0, 0.2),
+        description="控制轴 Y 轴颜色（保留设置，仅用于兼容已有颜色）",
+        default=(0.055, 0.42, 0.08),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
     axis_color_z: FloatVectorProperty(
         name="Z 轴颜色",
-        description="控制轴 Z 轴颜色",
-        default=(0.2, 0.5, 1.0),
+        description="控制轴 Z 轴颜色（保留设置，仅用于兼容已有颜色）",
+        default=(0.07, 0.18, 0.48),
         min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-
-    view_ring_color: FloatVectorProperty(
-        name="视图旋转圈颜色",
-        description="视图旋转外圈颜色",
-        default=(1.0, 1.0, 1.0),
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-
-    corner_tri_color: FloatVectorProperty(
-        name="视图平移三角颜色",
-        description="四个视图平移角三角颜色",
-        default=(1.0, 1.0, 1.0),
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-
-    gizmo_button_color: FloatVectorProperty(
-        name="按钮图标颜色",
-        description="三个图标按钮的轮廓颜色",
-        default=(1.0, 1.0, 1.0),
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-
-    gizmo_button_offset: FloatProperty(
-        name="按钮高度",
-        description="三个图标按钮距控制轴中心的高度（以轴长为倍数）",
-        default=1.15,
-        min=0.2,
-        max=15.0,
-        step=2,
-    )
-
-    gizmo_button_spacing: FloatProperty(
-        name="按钮间距",
-        description="三个图标按钮之间的水平间距（像素）",
-        default=30.0,
-        min=8.0,
-        max=100.0,
-        step=10,
-    )
-
-    gizmo_button_size: FloatProperty(
-        name="按钮大小",
-        description="三个图标按钮的半径（像素）",
-        default=30.0,
-        min=5.0,
-        max=30.0,
-        step=10,
     )
 
     def draw(self, context):
@@ -1604,18 +1559,6 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "pan_sensitivity")
         layout.prop(self, "zoom_sensitivity")
         layout.prop(self, "brush_size_sensitivity")
-        layout.prop(self, "gizmo_size")
-        layout.label(text="控制轴颜色")
-        layout.prop(self, "axis_color_x")
-        layout.prop(self, "axis_color_y")
-        layout.prop(self, "axis_color_z")
-        layout.prop(self, "view_ring_color")
-        layout.prop(self, "corner_tri_color")
-        layout.prop(self, "gizmo_button_color")
-        layout.label(text="按钮位置")
-        layout.prop(self, "gizmo_button_offset")
-        layout.prop(self, "gizmo_button_spacing")
-        layout.prop(self, "gizmo_button_size")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1775,6 +1718,102 @@ class ZBNAV_OT_switch_sculpt_target(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def get_zb_nav_subdivision(obj):
+    if obj is None or obj.type != "MESH":
+        return None
+    modifier = obj.modifiers.get("ZB-Nav 动态细分")
+    return modifier if modifier is not None and modifier.type == "SUBSURF" else None
+
+
+def set_sculpt_object_isolated(context, isolate):
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
+        return False
+
+    if isolate:
+        hidden_state = {}
+        for other in context.view_layer.objects:
+            if other == obj or other.type in {"CAMERA", "LIGHT"}:
+                continue
+            hidden_state[other.name] = bool(other.hide_get())
+            other.hide_set(True)
+        context.window_manager["zb_nav_isolate_state"] = hidden_state
+    else:
+        hidden_state = context.window_manager.get("zb_nav_isolate_state", {})
+        for name, was_hidden in hidden_state.items():
+            other = bpy.data.objects.get(name)
+            if other is not None and other.name in context.view_layer.objects:
+                other.hide_set(bool(was_hidden))
+        context.window_manager.pop("zb_nav_isolate_state", None)
+    tag_all_view3d_areas_for_redraw()
+    return True
+
+
+class ZBNAV_OT_toggle_isolate(bpy.types.Operator):
+    bl_idname = "zb_nav.toggle_isolate"
+    bl_label = "切换单独显示"
+    bl_options = {"INTERNAL"}
+
+    isolate: bpy.props.BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "SCULPT" and context.active_object is not None
+
+    def execute(self, context):
+        return {"FINISHED"} if set_sculpt_object_isolated(context, self.isolate) else {"CANCELLED"}
+
+
+class ZBNAV_OT_toggle_wireframe(bpy.types.Operator):
+    bl_idname = "zb_nav.toggle_wireframe"
+    bl_label = "切换物体网格"
+    bl_options = {"INTERNAL"}
+
+    enabled: bpy.props.BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "SCULPT" and context.active_object is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            return {"CANCELLED"}
+        obj.show_wire = self.enabled
+        obj.show_all_edges = self.enabled
+        tag_all_view3d_areas_for_redraw()
+        return {"FINISHED"}
+
+
+class ZBNAV_OT_toggle_subdivision(bpy.types.Operator):
+    bl_idname = "zb_nav.toggle_subdivision"
+    bl_label = "切换动态细分"
+    bl_options = {"REGISTER", "UNDO"}
+
+    enabled: bpy.props.BoolProperty(default=True)
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "SCULPT" and context.active_object is not None
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            return {"CANCELLED"}
+        modifier = get_zb_nav_subdivision(obj)
+        if self.enabled:
+            if modifier is None:
+                modifier = obj.modifiers.new("ZB-Nav 动态细分", "SUBSURF")
+                modifier.subdivision_type = "CATMULL_CLARK"
+                modifier.levels = 2
+                modifier.render_levels = 2
+            modifier.show_viewport = True
+        elif modifier is not None:
+            modifier.show_viewport = False
+        tag_all_view3d_areas_for_redraw()
+        return {"FINISHED"}
+
+
 class ZBNAV_PT_sculpt_target(bpy.types.Panel):
     bl_label = "ZB-Nav"
     bl_idname = "ZBNAV_PT_sculpt_target"
@@ -1789,29 +1828,44 @@ class ZBNAV_PT_sculpt_target(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         wm = context.window_manager
+        obj = context.active_object
 
-        move_box = layout.box()
-        move_box.label(text="移动模式（选择左侧移动工具开启）")
-        prefs = get_preferences(context)
-        if prefs:
-            move_box.prop(prefs, "gizmo_size", text="控制轴大小")
-            color_row = move_box.row(align=True)
-            color_row.prop(prefs, "axis_color_x")
-            color_row.prop(prefs, "axis_color_y")
-            color_row.prop(prefs, "axis_color_z")
-            color_row2 = move_box.row(align=True)
-            color_row2.prop(prefs, "view_ring_color")
-            color_row2.prop(prefs, "corner_tri_color")
-            move_box.prop(prefs, "gizmo_button_color", text="按钮图标颜色")
-            move_box.prop(prefs, "gizmo_button_offset", text="按钮高度")
-            move_box.prop(prefs, "gizmo_button_spacing", text="按钮间距")
-            move_box.prop(prefs, "gizmo_button_size", text="按钮大小")
-        move_box.label(text="外圈：视图旋转 · 四角：视图平移 · 中心：整体缩放")
-        move_box.label(text="Alt + 表面：重设轴心 / 拖动设 Z 朝向")
+        display_box = layout.box()
+        display_box.label(text="物体显示", icon="RESTRICT_VIEW_OFF")
+        isolated = bool(wm.get("zb_nav_isolate_state"))
+        isolate_op = display_box.operator(
+            "zb_nav.toggle_isolate",
+            text="关闭单独显示" if isolated else "单独显示",
+            icon="HIDE_OFF" if isolated else "HIDE_ON",
+            depress=isolated,
+        )
+        isolate_op.isolate = not isolated
+
+        wire_enabled = bool(obj and obj.type == "MESH" and obj.show_wire)
+        wire_op = display_box.operator(
+            "zb_nav.toggle_wireframe",
+            text="取消显示物体网格" if wire_enabled else "显示物体网格",
+            icon="SHADING_WIRE" if wire_enabled else "MESH_GRID",
+            depress=wire_enabled,
+        )
+        wire_op.enabled = not wire_enabled
+
+        subdivision = get_zb_nav_subdivision(obj)
+        subdivision_enabled = bool(subdivision and subdivision.show_viewport)
+        subdiv_op = display_box.operator(
+            "zb_nav.toggle_subdivision",
+            text="关闭动态细分" if subdivision_enabled else "开启动态细分",
+            icon="MOD_SUBSURF",
+            depress=subdivision_enabled,
+        )
+        subdiv_op.enabled = not subdivision_enabled
+        if subdivision is not None:
+            level_row = display_box.row(align=True)
+            level_row.enabled = subdivision_enabled
+            level_row.prop(subdivision, "levels", text="细分级数", slider=True)
 
         layout.separator()
         box = layout.box()
-        box.label(text="Alt + 鼠标中键  平移 / 缩放视图", icon="MOUSE_MOVE")
         box.label(text="Ctrl + 左键：模型笔刷 / 空白套索", icon="BRUSH_MASK")
         box.label(text="Ctrl 点击空白 = 填充全部遮罩", icon="RESTRICT_SELECT_OFF")
         box.label(text="Ctrl 空白套索未遮到物体 = 清除遮罩", icon="BRUSH_DATA")
@@ -2128,13 +2182,9 @@ def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=3
     _draw_polyline_2d(shader, points, color)
 
 
-def _gizmo_button_positions(context, origin_screen):
-    prefs = get_preferences(context)
-    gizmo_size = prefs.gizmo_size if prefs else 1.0
-    offset = prefs.gizmo_button_offset if prefs else GIZMO_BUTTON_Y_OFFSET
-    spacing = prefs.gizmo_button_spacing if prefs else GIZMO_BUTTON_SPACING
-    # offset is a multiple of the gizmo's on-screen pixel size
-    pixel_offset = GIZMO_PIXEL_SIZE * gizmo_size * offset
+def _gizmo_button_positions(_context, origin_screen):
+    pixel_offset = GIZMO_PIXEL_SIZE * GIZMO_BUTTON_Y_OFFSET
+    spacing = GIZMO_BUTTON_SPACING
     base_y = origin_screen.y + pixel_offset
     return [
         (origin_screen.x - spacing, base_y),
@@ -2145,13 +2195,11 @@ def _gizmo_button_positions(context, origin_screen):
 
 def _button_size(context):
     prefs = get_preferences(context)
-    if prefs:
-        return prefs.gizmo_button_size
     return GIZMO_BUTTON_RADIUS
 
 
-def _button_color(context):
-    return _pref_color3(context, "gizmo_button_color", (1.0, 1.0, 1.0))
+def _button_color(_context):
+    return (0.32, 0.32, 0.32)
 
 
 def _draw_button_icon(shader, cx, cy, kind, hover, size, color):
@@ -2398,8 +2446,7 @@ def draw_move_mode_gizmo():
                 inner_points.append((si.x, si.y))
                 outer_points.append((so.x, so.y))
         if len(inner_points) >= 3:
-            vr = _pref_color3(context, "view_ring_color", (1.0, 1.0, 1.0))
-            outer_color = (vr[0], vr[1], vr[2], 1.0)
+            outer_color = (0.82, 0.82, 0.82, 1.0) if hover and hover[0] == "view_rotate" else (0.52, 0.52, 0.52, 1.0)
             _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
         # four corner triangles: translate in the view plane (squat, farther out)
@@ -2419,8 +2466,7 @@ def draw_move_mode_gizmo():
             rnorm = math.hypot(rx, ry) or 1.0
             dx, dy = rx / rnorm, ry / rnorm
             px, py = -dy, dx
-            corner_color = _pref_color3(context, "corner_tri_color", (1.0, 1.0, 1.0))
-            corner_color = (corner_color[0], corner_color[1], corner_color[2], 1.0)
+            corner_color = (0.82, 0.82, 0.82, 1.0) if hover and hover[0] == "view_move" and hover[1] == corner else (0.52, 0.52, 0.52, 1.0)
             if hover and hover[0] == "view_move" and hover[1] == corner:
                 corner_color = (1.0, 1.0, 1.0, 1.0)
             apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
@@ -2626,6 +2672,9 @@ def unregister_view3d_header_buttons():
 CLASSES = (
     ZBNAV_AddonPreferences,
     ZBNAV_OT_switch_sculpt_target,
+    ZBNAV_OT_toggle_isolate,
+    ZBNAV_OT_toggle_wireframe,
+    ZBNAV_OT_toggle_subdivision,
     ZBNAV_PT_sculpt_target,
     ZBNAV_OT_pan_or_zoom,
     ZBNAV_OT_space_brush_size,
