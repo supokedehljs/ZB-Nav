@@ -8,7 +8,9 @@ bl_info = {
     "category": "3D View",
 }
 
+import logging
 import math
+import os
 
 import blf
 import bpy
@@ -35,6 +37,24 @@ CTRL_HIT_STATUS_X = 0
 CTRL_HIT_STATUS_Y = 0
 CTRL_LASSO_POINTS = []
 MOVE_MODE_HOVER = None
+
+_LOG = logging.getLogger("ZB-Nav")
+_LOG.setLevel(logging.INFO)
+if not _LOG.handlers:
+    _handler = logging.FileHandler(
+        os.path.join(os.path.expanduser("~"), "zb_nav_ctrl.log"),
+        encoding="utf-8",
+    )
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _LOG.addHandler(_handler)
+
+
+def _ctrl_log(message, *args):
+    _LOG.info(message, *args)
+
+
+def _ctrl_log_exception(message, *args):
+    _LOG.exception(message, *args)
 MOVE_GIZMO_PIVOT = None
 MAX_BRUSH_SIZE = 5000
 
@@ -1287,7 +1307,11 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
 
     def invoke(self, context, event):
         global CTRL_DIAGNOSTIC_RUNNING, CTRL_LASSO_POINTS
+        if CTRL_DIAGNOSTIC_RUNNING:
+            _ctrl_log("duplicate Ctrl monitor invoke ignored")
+            return {"CANCELLED"}
         CTRL_DIAGNOSTIC_RUNNING = True
+        _ctrl_log("Ctrl monitor started mode=%s object=%s", context.mode, getattr(context.active_object, "name", None))
         self._lasso_active = False
         self._lasso_points = []
         self._lasso_subtract = False
@@ -1304,6 +1328,10 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
 
     def _finish(self, context):
         global CTRL_DIAGNOSTIC_RUNNING, CTRL_LASSO_POINTS
+        _ctrl_log("Ctrl monitor finished lasso=%s native_mask=%s", self._lasso_active, self._native_mask_active)
+        self._lasso_active = False
+        self._native_mask_active = False
+        self._lasso_points = []
         CTRL_DIAGNOSTIC_RUNNING = False
         CTRL_LASSO_POINTS = []
         if context.area:
@@ -1336,12 +1364,15 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 )
                 CTRL_HIT_STATUS = "套索：已减选遮罩" if self._lasso_subtract else "套索：已添加遮罩"
         except Exception as exc:
+            _ctrl_log_exception("lasso release failed points=%d subtract=%s", len(points), self._lasso_subtract)
             CTRL_HIT_STATUS = f"遮罩操作失败: {exc}"
         if context.area:
             context.area.tag_redraw()
 
     def modal(self, context, event):
         global CTRL_HIT_STATUS, CTRL_HIT_STATUS_X, CTRL_HIT_STATUS_Y
+        if event.type in {"LEFTMOUSE", "ESC"} or event.ctrl:
+            _ctrl_log("event type=%s value=%s ctrl=%s alt=%s shift=%s lasso=%s native=%s", event.type, event.value, event.ctrl, event.alt, event.shift, self._lasso_active, self._native_mask_active)
         global CTRL_LASSO_POINTS
         if not is_zbrush_sculpt_mode(context):
             return self._finish(context)
@@ -1364,6 +1395,10 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
         if self._native_mask_active:
             if event.type == "LEFTMOUSE" and event.value == "RELEASE":
                 self._native_mask_active = False
+                _ctrl_log("native mask stroke released")
+            elif event.type == "ESC" and event.value == "PRESS":
+                self._native_mask_active = False
+                _ctrl_log("native mask stroke cancelled")
             return {"PASS_THROUGH"}
 
         if event.type == "ESC" and event.value == "PRESS":
@@ -1402,6 +1437,7 @@ class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
                 self._lasso_points = []
                 CTRL_LASSO_POINTS = []
                 self._handle_lasso_release(context, points)
+                _ctrl_log("lasso released points=%d", len(points))
                 return {"RUNNING_MODAL"}
 
         if (
