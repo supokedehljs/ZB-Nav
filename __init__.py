@@ -9,12 +9,13 @@ bl_info = {
 }
 
 import math
+import time
 
 import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import FloatProperty, FloatVectorProperty
+from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, IntProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -25,6 +26,13 @@ HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 VIEW3D_DRAW_HANDLER = None
 MOVE_MODE_HOVER = None
 GIZMO_HOVER_MONITOR_RUNNING = False
+# Vertices at or above this mask value are left alone by gizmo transforms.
+MASK_SKIP_THRESHOLD = 0.999
+# The move-tool lookup walks a private Blender API, so cache its answer briefly.
+TOOL_CACHE_SECONDS = 0.15
+_MOVE_TOOL_CACHE = {"time": -1.0, "active": False}
+# Alt+drag view orbit: degrees of rotation per pixel of mouse travel.
+ORBIT_DEGREES_PER_PIXEL = 0.25
 
 MOVE_GIZMO_PIVOT = None
 ZBRUSH_KEYMAP_ITEMS = [
@@ -62,6 +70,33 @@ def get_preferences(context):
     if addon:
         return addon.preferences
     return None
+
+
+def _pref(context, name, default=None):
+    """Read one add-on preference, falling back to a literal default."""
+    try:
+        prefs = get_preferences(context)
+    except Exception:
+        prefs = None
+    if prefs is None:
+        return default
+    value = getattr(prefs, name, default)
+    return default if value is None else value
+
+
+def _pref_color(context, name, default):
+    """Read a colour preference as an RGBA tuple."""
+    value = _pref(context, name, default)
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]), 1.0)
+    except (TypeError, IndexError, ValueError):
+        return (float(default[0]), float(default[1]), float(default[2]), 1.0)
+
+
+def _draw_error(context, where, exc):
+    """Report a drawing error, but only when debugging is switched on."""
+    if _pref(context, "debug_output", False):
+        print(f"[ZB-Nav] {where} failed: {exc!r}")
 
 
 def get_nav_mode(context):
@@ -297,6 +332,8 @@ GIZMO_CORNER_TRI_HALF_WID = 22.0
 GIZMO_BUTTON_RADIUS = 10.0
 GIZMO_BUTTON_SPACING = 26.0
 GIZMO_BUTTON_Y_OFFSET = 1.15
+GIZMO_HANDLE_COLOR = (0.52, 0.52, 0.52)
+GIZMO_BUTTON_COLOR = (0.32, 0.32, 0.32)
 GIZMO_BUTTON_TOOLTIPS = (
     ("重置轴向", "恢复世界方向，保留轴心位置"),
     ("回到物体原点", "轴心位置和方向匹配物体原点"),
@@ -316,30 +353,42 @@ def _pivot_from_list(data):
     return m
 
 
+def _pivot_is_per_object(obj):
+    """True when the mesh is owned by a single object.
+
+    The pivot is stored on the mesh data so it reverts together with the mesh
+    when a gizmo transform is undone. Mesh data shared by several objects must
+    not carry a per-object pivot, so those fall back to the in-memory cache.
+    """
+    return bool(obj and obj.data and getattr(obj.data, "users", 1) <= 1)
+
+
 def _get_gizmo_matrix(context):
+    """Return the pivot matrix without writing to any ID data.
+
+    This runs from the POST_PIXEL draw handler too, so it must stay read-only.
+    """
     global MOVE_GIZMO_PIVOT
     obj = context.active_object
     if not obj:
         return None
-    # The pivot lives on the mesh data so it reverts together with the mesh
-    # when the user undoes a gizmo transform.
-    if obj.data and "zb_nav_pivot" in obj.data:
-        matrix = _pivot_from_list(obj.data["zb_nav_pivot"])
-        MOVE_GIZMO_PIVOT = (obj.name, matrix)
-        return matrix
+
+    if _pivot_is_per_object(obj):
+        stored = obj.data.get("zb_nav_pivot")
+        if stored is not None:
+            try:
+                matrix = _pivot_from_list(stored)
+            except (TypeError, ValueError, IndexError):
+                matrix = None
+            if matrix is not None:
+                MOVE_GIZMO_PIVOT = (obj.name, matrix)
+                return matrix
+
     if MOVE_GIZMO_PIVOT is not None and MOVE_GIZMO_PIVOT[0] == obj.name:
-        matrix = MOVE_GIZMO_PIVOT[1]
-        try:
-            obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
-        except Exception:
-            pass
-        return matrix
+        return MOVE_GIZMO_PIVOT[1]
+
     matrix = obj.matrix_world.copy()
     MOVE_GIZMO_PIVOT = (obj.name, matrix)
-    try:
-        obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
-    except Exception:
-        pass
     return matrix
 
 
@@ -347,10 +396,10 @@ def _set_gizmo_matrix(obj_name, matrix):
     global MOVE_GIZMO_PIVOT
     MOVE_GIZMO_PIVOT = (obj_name, matrix.copy())
     obj = bpy.data.objects.get(obj_name)
-    if obj and obj.data:
+    if _pivot_is_per_object(obj):
         try:
             obj.data["zb_nav_pivot"] = _pivot_to_list(matrix)
-        except Exception:
+        except (TypeError, ValueError, AttributeError):
             pass
 
 
@@ -370,46 +419,54 @@ def _scale_matrix_about_axis(origin, axis, factor):
     )
 
 
-def _mesh_vertex_mask(obj, vertex_index):
-    """Return Blender's sculpt mask value for one mesh vertex."""
+def _sculpt_mask_values(obj, vertex_count):
+    """Return the sculpt mask layer data, or None when there is no usable mask."""
     if not obj or not obj.data:
-        return 0.0
+        return None
     mask_layer = obj.data.attributes.get(".sculpt_mask")
-    if mask_layer and vertex_index < len(mask_layer.data):
-        try:
-            return max(0.0, min(1.0, float(mask_layer.data[vertex_index].value)))
-        except (AttributeError, TypeError, ValueError):
-            pass
-    return 0.0
+    if mask_layer is None or len(mask_layer.data) < vertex_count:
+        return None
+    return mask_layer.data
 
 
-def _unmasked_world_center(obj):
-    """Return the center of vertices that are not sculpt-masked."""
-    points = [
-        obj.matrix_world @ vertex.co
-        for vertex in obj.data.vertices
-        if _mesh_vertex_mask(obj, vertex.index) < 0.999
-    ]
-    if not points:
-        return obj.matrix_world.translation.copy()
+def _mesh_bounds_center(obj):
+    """World-space center of the mesh bounding box."""
+    if not obj or not obj.data:
+        return mathutils.Vector((0.0, 0.0, 0.0))
+    matrix = obj.matrix_world
+    corners = obj.bound_box
     center = mathutils.Vector((0.0, 0.0, 0.0))
-    for point in points:
-        center += point
-    return center / len(points)
+    for corner in corners:
+        center += matrix @ mathutils.Vector(corner)
+    return center / (len(corners) or 1)
 
 
 def _transform_mesh_in_world(obj, world_transform):
-    """Transform only unmasked mesh vertices in world space."""
+    """Transform unmasked mesh vertices in world space.
+
+    The mask layer is resolved once: looking it up per vertex costs an RNA
+    property read for every vertex on every mouse move.
+    """
+    vertices = obj.data.vertices
+    mask_data = _sculpt_mask_values(obj, len(vertices))
     object_to_world = obj.matrix_world.copy()
     local_transform = (
         object_to_world.inverted_safe()
         @ world_transform
         @ object_to_world
     )
-    for vertex in obj.data.vertices:
-        if _mesh_vertex_mask(obj, vertex.index) < 0.999:
+    moved = False
+    if mask_data is None:
+        for vertex in vertices:
             vertex.co = local_transform @ vertex.co
-    obj.data.update()
+        moved = len(vertices) > 0
+    else:
+        for vertex in vertices:
+            if mask_data[vertex.index].value < MASK_SKIP_THRESHOLD:
+                vertex.co = local_transform @ vertex.co
+                moved = True
+    if moved:
+        obj.data.update()
 
 
 def _gizmo_world_axes(context):
@@ -424,6 +481,14 @@ def _gizmo_world_axes(context):
     return origin, axes
 
 
+def _axis_pixels(context):
+    """On-screen length of the gizmo axes, in pixels."""
+    try:
+        return max(20.0, float(_pref(context, "axis_length", GIZMO_PIXEL_SIZE)))
+    except (TypeError, ValueError):
+        return GIZMO_PIXEL_SIZE
+
+
 def _gizmo_length(context):
     matrix = _get_gizmo_matrix(context)
     if matrix is None:
@@ -434,7 +499,7 @@ def _gizmo_length(context):
     if not region or not region_3d:
         return 1.0
 
-    target_pixels = GIZMO_PIXEL_SIZE
+    target_pixels = _axis_pixels(context)
 
     right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
     a = view3d_utils.location_3d_to_region_2d(region, region_3d, origin)
@@ -453,6 +518,15 @@ def _to_screen(context, world_pos):
     if not region or not region_3d:
         return None
     return view3d_utils.location_3d_to_region_2d(region, region_3d, world_pos)
+
+
+def _gizmo_screen_reach(context):
+    """Screen radius covering every handle, including the pivot buttons.
+
+    Used to reject far-away picks before doing the expensive projections.
+    """
+    offset = max(1.6, _button_offset(context))
+    return _axis_pixels(context) * offset + _button_size(context) + 24.0
 
 
 def _axis_drag_angle(context, origin, axis, previous, current):
@@ -498,6 +572,15 @@ def _move_mode_pick(context, mouse_x, mouse_y):
     origin, axes = _gizmo_world_axes(context)
     if origin is None:
         return None
+    origin_screen = _to_screen(context, origin)
+    if origin_screen is None:
+        return None
+
+    # Cheap reject: nothing can be hit outside this radius, so skip the ~140
+    # projections a full pick would otherwise run on every mouse move.
+    if math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y) > _gizmo_screen_reach(context):
+        return None
+
     length = _gizmo_length(context)
     candidates = []
 
@@ -579,7 +662,6 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 candidates.append((d - 16.0, "view_move", corner))
 
     # center square: uniform scale
-    origin_screen = _to_screen(context, origin)
     if origin_screen:
         d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
         candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
@@ -659,13 +741,28 @@ def _set_pivot_world_point(context, world_point, z_direction=None):
 
 
 def _is_move_tool_active(context):
+    """Is the ZB-Nav move tool the active sculpt tool?
+
+    The lookup walks a private Blender API and runs from the draw handler and
+    from every hover event, so the answer is cached for a moment.
+    """
+    now = time.monotonic()
+    if now - _MOVE_TOOL_CACHE["time"] < TOOL_CACHE_SECONDS:
+        return _MOVE_TOOL_CACHE["active"]
+
+    active = False
     try:
         from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
         cls = ToolSelectPanelHelper._tool_class_from_space_type("VIEW_3D")
         _item, tool_active, _icon = cls._tool_get_active(context, "VIEW_3D", "SCULPT")
-        return tool_active is not None and tool_active.idname == ZBNAV_MOVE_TOOL.bl_idname
-    except Exception:
-        return False
+        active = tool_active is not None and tool_active.idname == ZBNAV_MOVE_TOOL.bl_idname
+    except Exception as exc:
+        _draw_error(context, "move tool lookup", exc)
+        active = False
+
+    _MOVE_TOOL_CACHE["time"] = now
+    _MOVE_TOOL_CACHE["active"] = active
+    return active
 
 
 class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
@@ -692,7 +789,9 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     bl_idname = "zb_nav.move_mode_drag"
     bl_label = "Move Mode Drag"
     bl_description = "拖动变换轴控制物体移动/缩放/旋转"
-    bl_options = {"REGISTER", "UNDO"}
+    # No "UNDO" here: the operator pushes its own undo step at drag start so
+    # one drag stays one undo step.
+    bl_options = {"REGISTER"}
 
     _drag_handle = None
     _last_x = 0
@@ -767,8 +866,8 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
             # move to object origin, rotation aligned to origin
             _set_gizmo_matrix(obj.name, obj.matrix_world.copy())
         else:
-            # move to the center of the visible/unmasked mesh
-            center = _unmasked_world_center(obj)
+            # move to the center of the mesh bounding box
+            center = _mesh_bounds_center(obj)
             loc, rot, scale = matrix.decompose()
             matrix = mathutils.Matrix.LocRotScale(center, rot, scale)
             _set_gizmo_matrix(obj.name, matrix)
@@ -895,7 +994,7 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
                     self._last_y - origin_screen.y,
                 ))
                 signed_delta = mouse_vec.dot(normal) - prev_vec.dot(normal)
-                factor = max(0.001, 1.0 + signed_delta / GIZMO_PIXEL_SIZE)
+                factor = max(0.001, 1.0 + signed_delta / _axis_pixels(context))
                 transform = mathutils.Matrix.Translation(origin)
                 transform = transform @ mathutils.Matrix.Scale(factor, 4) @ transform.inverted()
                 _transform_mesh_in_world(obj, transform)
@@ -1142,22 +1241,29 @@ def update_navigation_mode(context, mode):
     return True
 
 
-_HOVER_MONITOR_LAST_SCULPT = None
+_SCULPT_MODE_LAST_STATE = None
 
 
-def _hover_monitor_handler(scene, depsgraph):
-    """进入雕刻模式时补启动悬停监测（不会自动打开 ZBrush 开关）。"""
-    global _HOVER_MONITOR_LAST_SCULPT
+def _sculpt_mode_handler(scene, depsgraph):
+    """Keep the sub-mode and its hover monitor in sync when entering sculpt mode.
+
+    The ZBrush switch is only turned on by itself when the user opted in
+    through the "自动开启" preference; otherwise it stays manual.
+    """
+    global _SCULPT_MODE_LAST_STATE
     context = bpy.context
     is_sculpt = context.mode == "SCULPT"
-    if is_sculpt == _HOVER_MONITOR_LAST_SCULPT:
+    if is_sculpt == _SCULPT_MODE_LAST_STATE:
         return
-    _HOVER_MONITOR_LAST_SCULPT = is_sculpt
-    if is_sculpt and is_navigation_enabled(context):
+    _SCULPT_MODE_LAST_STATE = is_sculpt
+
+    if not is_sculpt:
+        return
+    if is_navigation_enabled(context) or _pref(context, "auto_enable_in_sculpt", False):
         try:
             update_navigation_mode(context, "ZBRUSH")
-        except Exception:
-            pass
+        except Exception as exc:
+            _draw_error(context, "sculpt mode handler", exc)
 
 
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
@@ -1185,6 +1291,98 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
+    zoom_direction_invert: BoolProperty(
+        name="反向缩放",
+        description="勾选后鼠标移动方向与缩放方向相反",
+        default=False,
+    )
+
+    enable_pan_to_zoom: BoolProperty(
+        name="松开 Alt 切换为缩放",
+        description="Alt + 中键拖动过程中松开 Alt 时，把这次拖动转成缩放；关闭则始终平移",
+        default=True,
+    )
+
+    alt_drag_orbits_view: BoolProperty(
+        name="Alt + 左键拖动旋转视图",
+        description="点击仍切换雕刻对象，拖动则旋转视图；关闭后按下即切换",
+        default=True,
+    )
+
+    alt_drag_threshold: IntProperty(
+        name="拖动判定",
+        description="Alt + 左键移动超过这个像素距离才算拖动，用来避免误触发切换",
+        default=6,
+        min=0,
+        max=40,
+    )
+
+    axis_length: IntProperty(
+        name="控制轴长度",
+        description="控制轴在屏幕上的长度（像素）",
+        default=int(GIZMO_PIXEL_SIZE),
+        min=40,
+        max=300,
+    )
+
+    button_offset: FloatProperty(
+        name="按钮高度",
+        description="三个轴心按钮距控制轴中心的高度（以轴长为倍数）",
+        default=GIZMO_BUTTON_Y_OFFSET,
+        min=0.6,
+        max=3.0,
+        soft_min=0.8,
+        soft_max=2.0,
+        step=10,
+    )
+
+    button_spacing: IntProperty(
+        name="按钮间距",
+        description="三个轴心按钮之间的水平间距（像素）",
+        default=int(GIZMO_BUTTON_SPACING),
+        min=8,
+        max=80,
+    )
+
+    button_size: IntProperty(
+        name="按钮大小",
+        description="轴心按钮的尺寸（像素）",
+        default=int(GIZMO_BUTTON_RADIUS),
+        min=4,
+        max=30,
+    )
+
+    show_arrows: BoolProperty(
+        name="轴向箭头",
+        description="显示三个轴向的移动箭头与缩放矩形",
+        default=True,
+    )
+    show_axis_rings: BoolProperty(
+        name="轴向旋转环",
+        description="显示三条轴向旋转环",
+        default=True,
+    )
+    show_view_ring: BoolProperty(
+        name="视图旋转外圈",
+        description="显示最外圈的视图旋转环",
+        default=True,
+    )
+    show_corner_handles: BoolProperty(
+        name="四角平移手柄",
+        description="显示四个角的视图平移三角",
+        default=True,
+    )
+    show_center_handle: BoolProperty(
+        name="中心方块",
+        description="显示中心方块的等比缩放手柄",
+        default=True,
+    )
+    show_pivot_buttons: BoolProperty(
+        name="轴心按钮",
+        description="显示轴心上方的三个轴心预设按钮",
+        default=True,
+    )
+
     axis_color_x: FloatVectorProperty(
         name="X 轴颜色",
         description="控制轴 X 轴颜色",
@@ -1203,16 +1401,81 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         default=(0.07, 0.18, 0.48),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
+    ring_color: FloatVectorProperty(
+        name="外圈与旋转环颜色",
+        description="视图旋转外圈与轴向旋转环的颜色",
+        default=GIZMO_HANDLE_COLOR,
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+    corner_color: FloatVectorProperty(
+        name="四角手柄颜色",
+        description="四个角的视图平移三角颜色",
+        default=GIZMO_HANDLE_COLOR,
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+    button_icon_color: FloatVectorProperty(
+        name="按钮图标颜色",
+        description="三个轴心按钮的图标颜色（悬停时变为白色）",
+        default=GIZMO_BUTTON_COLOR,
+        min=0.0, max=1.0, size=3, subtype="COLOR",
+    )
+
+    auto_enable_in_sculpt: BoolProperty(
+        name="进入雕刻模式时自动开启",
+        description="进入雕刻模式时自动打开 ZBrush 子模式；默认关闭，由标题栏按钮手动控制",
+        default=False,
+    )
+
+    debug_output: BoolProperty(
+        name="调试输出",
+        description="把控制轴绘制中捕获到的异常打印到系统控制台",
+        default=False,
+    )
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "pan_sensitivity")
-        layout.prop(self, "zoom_sensitivity")
-        layout.label(text="控制轴颜色")
-        color_row = layout.row(align=True)
+
+        nav_box = layout.box()
+        nav_box.label(text="导航（Alt + 中键）")
+        nav_box.prop(self, "pan_sensitivity")
+        nav_box.prop(self, "zoom_sensitivity")
+        nav_box.prop(self, "enable_pan_to_zoom")
+        nav_box.prop(self, "zoom_direction_invert")
+
+        switch_box = layout.box()
+        switch_box.label(text="切换物体（Alt + 左键）")
+        switch_box.prop(self, "alt_drag_orbits_view")
+        threshold_row = switch_box.row()
+        threshold_row.enabled = self.alt_drag_orbits_view
+        threshold_row.prop(self, "alt_drag_threshold")
+
+        gizmo_box = layout.box()
+        gizmo_box.label(text="控制轴")
+        gizmo_box.prop(self, "axis_length")
+        gizmo_box.prop(self, "button_offset")
+        gizmo_box.prop(self, "button_spacing")
+        gizmo_box.prop(self, "button_size")
+        gizmo_box.label(text="显示部件")
+        show_column = gizmo_box.column(align=True)
+        show_column.prop(self, "show_arrows")
+        show_column.prop(self, "show_axis_rings")
+        show_column.prop(self, "show_view_ring")
+        show_column.prop(self, "show_corner_handles")
+        show_column.prop(self, "show_center_handle")
+        show_column.prop(self, "show_pivot_buttons")
+        gizmo_box.label(text="颜色")
+        color_row = gizmo_box.row(align=True)
         color_row.prop(self, "axis_color_x", text="")
         color_row.prop(self, "axis_color_y", text="")
         color_row.prop(self, "axis_color_z", text="")
+        color_row.prop(self, "ring_color", text="")
+        color_row.prop(self, "corner_color", text="")
+        color_row.prop(self, "button_icon_color", text="")
+
+        misc_box = layout.box()
+        misc_box.label(text="其他")
+        misc_box.prop(self, "auto_enable_in_sculpt")
+        misc_box.prop(self, "debug_output")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1276,7 +1539,7 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
                 dx = current_x - self._last_mouse_x
                 dy = current_y - self._last_mouse_y
 
-                if event.alt:
+                if event.alt or not _pref(context, "enable_pan_to_zoom", True):
                     self._pan_view(context, current_x, current_y)
                 else:
                     if self._was_alt_pressed and not self._converted_pan_to_zoom:
@@ -1341,6 +1604,8 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
         # Blender's region Y coordinate increases upward; invert it so screen-down
         # contributes in the same direction as screen-right, matching ZBrush.
         delta = dx - dy
+        if _pref(context, "zoom_direction_invert", False):
+            delta = -delta
         zoom_factor = math.exp(-delta * 0.01 * sensitivity)
         new_distance = max(previous_distance * zoom_factor, 0.0001)
         ratio = new_distance / previous_distance
@@ -1354,17 +1619,86 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
 class ZBNAV_OT_alt_select_target(bpy.types.Operator):
     bl_idname = "zb_nav.alt_select_target"
     bl_label = "Switch Sculpt Target"
-    bl_description = "Alt + 左键单击切换到目标模型的雕刻模式"
+    bl_description = "Alt + 左键单击切换雕刻对象，拖动则旋转视图"
     bl_options = {"INTERNAL"}
+
+    _press_x = 0
+    _press_y = 0
+    _last_x = 0
+    _last_y = 0
+    _orbiting = False
 
     @classmethod
     def poll(cls, context):
         return is_zbrush_sculpt_mode(context)
 
     def invoke(self, context, event):
-        if event.alt and event.type == "LEFTMOUSE" and event.value == "PRESS":
+        if not (event.alt and event.type == "LEFTMOUSE" and event.value == "PRESS"):
+            return {"PASS_THROUGH"}
+        if not _pref(context, "alt_drag_orbits_view", True):
             return select_or_invert_sculpt_target(context, event)
-        return {"PASS_THROUGH"}
+
+        self._press_x = event.mouse_region_x
+        self._press_y = event.mouse_region_y
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        self._orbiting = False
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _threshold(self, context):
+        try:
+            return int(_pref(context, "alt_drag_threshold", 6))
+        except (TypeError, ValueError):
+            return 6
+
+    def _orbit_view(self, context, event):
+        """Orbit the view around its pivot so the model follows the cursor."""
+        region_3d = context.region_data
+        if region_3d is None:
+            return
+        dx = event.mouse_region_x - self._last_x
+        dy = event.mouse_region_y - self._last_y
+        self._last_x = event.mouse_region_x
+        self._last_y = event.mouse_region_y
+        if dx == 0 and dy == 0:
+            return
+
+        step = math.radians(ORBIT_DEGREES_PER_PIXEL)
+        view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+        view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+        # Horizontal drag orbits about the screen-up axis, vertical drag about
+        # the screen-right axis: the model follows the cursor and never rolls.
+        rotation = (
+            mathutils.Quaternion(view_up, -dx * step)
+            @ mathutils.Quaternion(view_right, dy * step)
+        )
+        region_3d.view_rotation = rotation @ region_3d.view_rotation
+        if context.area:
+            context.area.tag_redraw()
+
+    def modal(self, context, event):
+        if event.type == "MOUSEMOVE":
+            if not self._orbiting:
+                threshold = self._threshold(context)
+                if (
+                    abs(event.mouse_region_x - self._press_x) > threshold
+                    or abs(event.mouse_region_y - self._press_y) > threshold
+                ):
+                    self._orbiting = True
+            if self._orbiting:
+                self._orbit_view(context, event)
+            return {"RUNNING_MODAL"}
+
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            if not self._orbiting:
+                select_or_invert_sculpt_target(context, event)
+            return {"FINISHED"}
+
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            return {"FINISHED"}
+
+        return {"RUNNING_MODAL"}
 
 
 class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
@@ -1441,10 +1775,24 @@ def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=3
     _draw_polyline_2d(shader, points, color)
 
 
-def _gizmo_button_positions(_context, origin_screen):
-    # GIZMO_BUTTON_Y_OFFSET 是轴在屏幕上的像素长度的倍数。
-    pixel_offset = GIZMO_PIXEL_SIZE * GIZMO_BUTTON_Y_OFFSET
-    spacing = GIZMO_BUTTON_SPACING
+def _button_offset(context):
+    """Pivot button height as a multiple of the gizmo's on-screen pixel length."""
+    try:
+        return max(0.6, float(_pref(context, "button_offset", GIZMO_BUTTON_Y_OFFSET)))
+    except (TypeError, ValueError):
+        return GIZMO_BUTTON_Y_OFFSET
+
+
+def _button_spacing(context):
+    try:
+        return float(_pref(context, "button_spacing", GIZMO_BUTTON_SPACING))
+    except (TypeError, ValueError):
+        return GIZMO_BUTTON_SPACING
+
+
+def _gizmo_button_positions(context, origin_screen):
+    pixel_offset = _axis_pixels(context) * _button_offset(context)
+    spacing = _button_spacing(context)
     base_y = origin_screen.y + pixel_offset
     return [
         (origin_screen.x - spacing, base_y),
@@ -1454,12 +1802,18 @@ def _gizmo_button_positions(_context, origin_screen):
 
 
 def _button_size(context):
-    prefs = get_preferences(context)
-    return GIZMO_BUTTON_RADIUS
+    try:
+        return float(_pref(context, "button_size", GIZMO_BUTTON_RADIUS))
+    except (TypeError, ValueError):
+        return GIZMO_BUTTON_RADIUS
 
 
-def _button_color(_context):
-    return (0.32, 0.32, 0.32)
+def _button_color(context):
+    value = _pref(context, "button_icon_color", GIZMO_BUTTON_COLOR)
+    try:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, IndexError, ValueError):
+        return GIZMO_BUTTON_COLOR
 
 
 def _draw_button_icon(shader, cx, cy, kind, hover, size, color):
@@ -1563,7 +1917,7 @@ def _draw_tube_band_2d(shader, context, origin, e1, e2, radius, tube_w, tube_h, 
     normal = e1.cross(e2)
     half_w = tube_w / 2.0
     half_h = tube_h / 2.0
-    segments = 128
+    segments = GIZMO_RING_SEGMENTS
 
     # Sample one contiguous arc instead of filtering 0..2pi, so the visible
     # half never spans the sampling boundary and no chord is created.
@@ -1621,6 +1975,7 @@ def draw_move_mode_gizmo():
     if origin is None:
         return
     length = _gizmo_length(context)
+    axis_pixels = _axis_pixels(context)
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
@@ -1631,6 +1986,14 @@ def draw_move_mode_gizmo():
         return
 
     hover = MOVE_MODE_HOVER
+    show_arrows = bool(_pref(context, "show_arrows", True))
+    show_axis_rings = bool(_pref(context, "show_axis_rings", True))
+    show_view_ring = bool(_pref(context, "show_view_ring", True))
+    show_corner_handles = bool(_pref(context, "show_corner_handles", True))
+    show_center_handle = bool(_pref(context, "show_center_handle", True))
+    show_pivot_buttons = bool(_pref(context, "show_pivot_buttons", True))
+    handle_color = _pref_color(context, "ring_color", GIZMO_HANDLE_COLOR)
+    corner_base_color = _pref_color(context, "corner_color", GIZMO_HANDLE_COLOR)
 
     def accent(base, kind):
         if hover and hover[1] == axis and hover[0] == kind:
@@ -1642,147 +2005,160 @@ def draw_move_mode_gizmo():
             color = _axis_color(context, axis)
             axis_dir = axes[axis]
 
-            tip_screen = _to_screen(context, origin + axis_dir * length)
-            base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
-            mid_screen = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
+            if show_arrows:
+                tip_screen = _to_screen(context, origin + axis_dir * length)
+                base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
+                mid_screen = _to_screen(context, origin + axis_dir * length * GIZMO_SCALE_POS)
 
-            if tip_screen and origin_screen:
-                _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
+                if tip_screen:
+                    _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), accent(color, "move"))
 
-            if tip_screen and base_screen:
-                _draw_tri_along_axis(
-                    shader,
-                    (tip_screen.x, tip_screen.y),
-                    (base_screen.x, base_screen.y),
-                    accent(color, "move"),
-                    GIZMO_MOVE_TRI_HALF_WID,
+                if tip_screen and base_screen:
+                    _draw_tri_along_axis(
+                        shader,
+                        (tip_screen.x, tip_screen.y),
+                        (base_screen.x, base_screen.y),
+                        accent(color, "move"),
+                        GIZMO_MOVE_TRI_HALF_WID,
+                    )
+
+                if mid_screen and tip_screen:
+                    _draw_rect_along_axis(
+                        shader,
+                        (mid_screen.x, mid_screen.y),
+                        (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
+                        accent(color, "scale"),
+                        GIZMO_SCALE_RECT_LEN,
+                        GIZMO_SCALE_RECT_WID,
+                    )
+
+            if show_axis_rings:
+                radius = length * GIZMO_RING_RADIUS
+                other1 = axes[(axis + 1) % 3]
+                other2 = axes[(axis + 2) % 3]
+                view_dir = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
+                axis_ring_color = accent(color, "rotate")
+                axis_ring_color = (
+                    axis_ring_color[0], axis_ring_color[1], axis_ring_color[2], 1.0
                 )
-
-            if mid_screen and tip_screen and origin_screen:
-                _draw_rect_along_axis(
+                _draw_tube_band_2d(
                     shader,
-                    (mid_screen.x, mid_screen.y),
-                    (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
-                    accent(color, "scale"),
-                    GIZMO_SCALE_RECT_LEN,
-                    GIZMO_SCALE_RECT_WID,
+                    context,
+                    origin,
+                    other1,
+                    other2,
+                    radius,
+                    length * (GIZMO_RING_TUBE_W / axis_pixels),
+                    length * (GIZMO_RING_TUBE_H / axis_pixels),
+                    view_dir,
+                    axis_ring_color,
                 )
+        except Exception as exc:
+            _draw_error(context, "gizmo axis", exc)
 
-            radius = length * GIZMO_RING_RADIUS
-            other1 = axes[(axis + 1) % 3]
-            other2 = axes[(axis + 2) % 3]
-            view_dir = region_3d.view_rotation @ mathutils.Vector((0, 0, -1))
-            ring_color = accent(color, "rotate")
-            ring_color = (ring_color[0], ring_color[1], ring_color[2], 1.0)
-            _draw_tube_band_2d(
-                shader,
-                context,
-                origin,
-                other1,
-                other2,
-                radius,
-                length * (GIZMO_RING_TUBE_W / GIZMO_PIXEL_SIZE),
-                length * (GIZMO_RING_TUBE_H / GIZMO_PIXEL_SIZE),
-                view_dir,
-                ring_color,
-            )
-        except Exception:
-            pass
+    # outer view-rotation ring (circle facing the camera) and the corner handles
+    if show_view_ring or show_corner_handles:
+        try:
+            view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
+            view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
+            outer_radius = length * GIZMO_VIEW_RING_RADIUS
+            band_world = length * (GIZMO_RING_BAND_PX / axis_pixels)
 
-    # outer view-rotation ring (circle facing the camera)
-    try:
-        view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
-        view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
-        outer_radius = length * GIZMO_VIEW_RING_RADIUS
-        band_world = length * (GIZMO_RING_BAND_PX / GIZMO_PIXEL_SIZE)
-        inner_points = []
-        outer_points = []
-        for t in range(GIZMO_RING_SEGMENTS + 1):
-            ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
-            dir_vec = view_right * math.cos(ang) + view_up * math.sin(ang)
-            si = _to_screen(context, origin + dir_vec * (outer_radius - band_world))
-            so = _to_screen(context, origin + dir_vec * (outer_radius + band_world))
-            if si and so:
-                inner_points.append((si.x, si.y))
-                outer_points.append((so.x, so.y))
-        if len(inner_points) >= 3:
-            outer_color = (0.82, 0.82, 0.82, 1.0) if hover and hover[0] == "view_rotate" else (0.52, 0.52, 0.52, 1.0)
-            _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
+            if show_view_ring:
+                inner_points = []
+                outer_points = []
+                for t in range(GIZMO_RING_SEGMENTS + 1):
+                    ang = 2.0 * math.pi * t / GIZMO_RING_SEGMENTS
+                    dir_vec = view_right * math.cos(ang) + view_up * math.sin(ang)
+                    si = _to_screen(context, origin + dir_vec * (outer_radius - band_world))
+                    so = _to_screen(context, origin + dir_vec * (outer_radius + band_world))
+                    if si and so:
+                        inner_points.append((si.x, si.y))
+                        outer_points.append((so.x, so.y))
+                if len(inner_points) >= 3:
+                    ring_hover = bool(hover and hover[0] == "view_rotate")
+                    outer_color = (1.0, 1.0, 1.0, 1.0) if ring_hover else handle_color
+                    _draw_ring_band_2d(shader, inner_points, outer_points, outer_color)
 
-        # four corner triangles: translate in the view plane (squat, farther out)
-        corner_angles = (45, 135, 225, 315)
-        corner_radius = length * GIZMO_CORNER_RADIUS
-        tri_height = GIZMO_CORNER_TRI_HEIGHT
-        tri_half_wid = GIZMO_CORNER_TRI_HALF_WID
-        for corner in range(4):
-            rad = math.radians(corner_angles[corner])
-            world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
-            screen = _to_screen(context, world)
-            if not screen:
-                continue
-            center = (screen.x, screen.y)
-            rx = screen.x - origin_screen.x
-            ry = screen.y - origin_screen.y
-            rnorm = math.hypot(rx, ry) or 1.0
-            dx, dy = rx / rnorm, ry / rnorm
-            px, py = -dy, dx
-            corner_color = (0.82, 0.82, 0.82, 1.0) if hover and hover[0] == "view_move" and hover[1] == corner else (0.52, 0.52, 0.52, 1.0)
-            if hover and hover[0] == "view_move" and hover[1] == corner:
-                corner_color = (1.0, 1.0, 1.0, 1.0)
-            apex = (center[0] + dx * tri_height, center[1] + dy * tri_height)
-            left = (center[0] + px * tri_half_wid, center[1] + py * tri_half_wid)
-            right = (center[0] - px * tri_half_wid, center[1] - py * tri_half_wid)
-            _draw_tri_2d(shader, apex, left, right, corner_color)
-    except Exception:
-        pass
+            if show_corner_handles:
+                # four squat triangles farther out: translate in the view plane
+                corner_angles = (45, 135, 225, 315)
+                corner_radius = length * GIZMO_CORNER_RADIUS
+                tri_height = GIZMO_CORNER_TRI_HEIGHT
+                tri_half_wid = GIZMO_CORNER_TRI_HALF_WID
+                for corner in range(4):
+                    rad = math.radians(corner_angles[corner])
+                    world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
+                    screen = _to_screen(context, world)
+                    if not screen:
+                        continue
+                    center = (screen.x, screen.y)
+                    rx = screen.x - origin_screen.x
+                    ry = screen.y - origin_screen.y
+                    rnorm = math.hypot(rx, ry) or 1.0
+                    dir_x, dir_y = rx / rnorm, ry / rnorm
+                    perp_x, perp_y = -dir_y, dir_x
+                    corner_hover = bool(
+                        hover and hover[0] == "view_move" and hover[1] == corner
+                    )
+                    corner_color = (1.0, 1.0, 1.0, 1.0) if corner_hover else corner_base_color
+                    apex = (center[0] + dir_x * tri_height, center[1] + dir_y * tri_height)
+                    left = (center[0] + perp_x * tri_half_wid, center[1] + perp_y * tri_half_wid)
+                    right = (center[0] - perp_x * tri_half_wid, center[1] - perp_y * tri_half_wid)
+                    _draw_tri_2d(shader, apex, left, right, corner_color)
+        except Exception as exc:
+            _draw_error(context, "gizmo view ring", exc)
 
     # redraw the three translation arrows last so the view ring never covers them
-    for axis in range(3):
-        try:
-            color = _axis_color(context, axis)
-            axis_dir = axes[axis]
-            tip_screen = _to_screen(context, origin + axis_dir * length)
-            base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
-            if tip_screen and base_screen:
-                arrow_color = accent(color, "move")
-                _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), arrow_color)
-                _draw_tri_along_axis(shader, (tip_screen.x, tip_screen.y), (base_screen.x, base_screen.y), arrow_color, GIZMO_MOVE_TRI_HALF_WID)
-        except Exception:
-            pass
+    if show_arrows:
+        for axis in range(3):
+            try:
+                color = _axis_color(context, axis)
+                axis_dir = axes[axis]
+                tip_screen = _to_screen(context, origin + axis_dir * length)
+                base_screen = _to_screen(context, origin + axis_dir * length * GIZMO_MOVE_TRI_BASE)
+                if tip_screen and base_screen:
+                    arrow_color = accent(color, "move")
+                    _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), arrow_color)
+                    _draw_tri_along_axis(shader, (tip_screen.x, tip_screen.y), (base_screen.x, base_screen.y), arrow_color, GIZMO_MOVE_TRI_HALF_WID)
+            except Exception as exc:
+                _draw_error(context, "gizmo arrows", exc)
 
     # center square: uniform scale (opaque)
-    try:
-        center_color = (1.0, 1.0, 1.0, 1.0)
-        half = GIZMO_CENTER_SQUARE_HALF
-        cx, cy = origin_screen.x, origin_screen.y
-        verts = [
-            (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
-            (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
-        ]
-        batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-        shader.bind()
-        shader.uniform_float("color", center_color)
-        batch.draw(shader)
-    except Exception:
-        pass
+    if show_center_handle:
+        try:
+            center_color = (1.0, 1.0, 1.0, 1.0)
+            half = GIZMO_CENTER_SQUARE_HALF
+            cx, cy = origin_screen.x, origin_screen.y
+            verts = [
+                (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
+                (cx - half, cy - half), (cx + half, cy + half), (cx - half, cy + half),
+            ]
+            batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+            shader.bind()
+            shader.uniform_float("color", center_color)
+            batch.draw(shader)
+        except Exception as exc:
+            _draw_error(context, "gizmo center handle", exc)
 
     # three gizmo buttons above the pivot
-    try:
-        btn_size = _button_size(context)
-        btn_color = _button_color(context)
-        button_positions = _gizmo_button_positions(context, origin_screen)
-        hovered_button = None
-        for btn in range(3):
-            bx, by = button_positions[btn]
-            btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
-            if btn_hover:
-                hovered_button = (btn, bx, by)
-            _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size, btn_color)
-        if hovered_button is not None:
-            btn, bx, by = hovered_button
-            _draw_gizmo_button_tooltip(shader, context, btn, bx, by, btn_size)
-    except Exception:
-        pass
+    if show_pivot_buttons:
+        try:
+            btn_size = _button_size(context)
+            btn_color = _button_color(context)
+            button_positions = _gizmo_button_positions(context, origin_screen)
+            hovered_button = None
+            for btn in range(3):
+                bx, by = button_positions[btn]
+                btn_hover = hover is not None and hover[0] == "gizmo_button" and hover[1] == btn
+                if btn_hover:
+                    hovered_button = (btn, bx, by)
+                _draw_button_icon(shader, bx, by, btn, btn_hover, btn_size, btn_color)
+            if hovered_button is not None:
+                btn, bx, by = hovered_button
+                _draw_gizmo_button_tooltip(shader, context, btn, bx, by, btn_size)
+        except Exception as exc:
+            _draw_error(context, "gizmo pivot buttons", exc)
 
     gpu.state.line_width_set(1.0)
     gpu.state.blend_set("NONE")
@@ -1856,16 +2232,16 @@ def register():
     register_view3d_header_buttons()
     register_view3d_draw_handler()
     add_zbrush_keymaps()
-    if not bpy.app.handlers.depsgraph_update_post.count(_hover_monitor_handler):
-        bpy.app.handlers.depsgraph_update_post.append(_hover_monitor_handler)
+    if not bpy.app.handlers.depsgraph_update_post.count(_sculpt_mode_handler):
+        bpy.app.handlers.depsgraph_update_post.append(_sculpt_mode_handler)
     tag_all_view3d_areas_for_redraw()
 
 
 def unregister():
     global GIZMO_HOVER_MONITOR_RUNNING
     GIZMO_HOVER_MONITOR_RUNNING = False
-    if bpy.app.handlers.depsgraph_update_post.count(_hover_monitor_handler):
-        bpy.app.handlers.depsgraph_update_post.remove(_hover_monitor_handler)
+    if bpy.app.handlers.depsgraph_update_post.count(_sculpt_mode_handler):
+        bpy.app.handlers.depsgraph_update_post.remove(_sculpt_mode_handler)
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
     unregister_view3d_draw_handler()
