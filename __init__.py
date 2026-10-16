@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 17, 1),
+    "version": (1, 18, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -15,7 +15,7 @@ import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, IntProperty
+from bpy.props import EnumProperty, FloatProperty, FloatVectorProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -33,6 +33,30 @@ TOOL_CACHE_SECONDS = 0.15
 _MOVE_TOOL_CACHE = {"time": -1.0, "active": False}
 # Alt+drag view orbit: degrees of rotation per pixel of mouse travel.
 ORBIT_DEGREES_PER_PIXEL = 0.25
+# Alt+left drag only counts as a drag past this distance, in pixels.
+ALT_DRAG_THRESHOLD = 6.0
+# Brush size drag: pixels of travel that change the size by the base amount.
+BRUSH_SIZE_BASE_RANGE = 100.0
+BRUSH_SIZE_MIN_FALLBACK = 1
+BRUSH_SIZE_MAX_FALLBACK = 5000
+# Keymaps the brush size trigger may have to take a key from.
+TRIGGER_KEYMAP_NAMES = (
+    "Window",
+    "Frames",
+    "Sculpt",
+    "3D View",
+    "3D View Generic",
+)
+TRIGGER_KEY_ITEMS = (
+    ("S", "S 键", "按住 S 再按住左键左右拖动"),
+    ("SPACE", "空格键", "按住空格再按住左键左右拖动"),
+)
+BRUSH_SIZE_DRAG_ACTIVE = False
+BRUSH_SIZE_CENTER_X = 0.0
+BRUSH_SIZE_CENTER_Y = 0.0
+_TRIGGER_KEY_YIELDED = None
+_TRIGGER_KEY_YIELDED_ITEMS = []
+_REPORTED_DRAW_ERRORS = set()
 
 MOVE_GIZMO_PIVOT = None
 ZBRUSH_KEYMAP_ITEMS = [
@@ -84,19 +108,27 @@ def _pref(context, name, default=None):
     return default if value is None else value
 
 
-def _pref_color(context, name, default):
-    """Read a colour preference as an RGBA tuple."""
-    value = _pref(context, name, default)
+def _ui_scale(context):
+    """Blender's interface scale, so drawn pixels follow high DPI screens."""
     try:
-        return (float(value[0]), float(value[1]), float(value[2]), 1.0)
-    except (TypeError, IndexError, ValueError):
-        return (float(default[0]), float(default[1]), float(default[2]), 1.0)
+        return max(0.5, float(context.preferences.system.ui_scale))
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+
+
+def _px(context, pixels):
+    """A UI pixel constant converted to region pixels at the current scale."""
+    return float(pixels) * _ui_scale(context)
 
 
 def _draw_error(context, where, exc):
-    """Report a drawing error, but only when debugging is switched on."""
-    if _pref(context, "debug_output", False):
-        print(f"[ZB-Nav] {where} failed: {exc!r}")
+    """Report a swallowed drawing error once, on the console."""
+    message = f"{where}: {exc!r}"
+    if message in _REPORTED_DRAW_ERRORS:
+        return
+    if len(_REPORTED_DRAW_ERRORS) < 32:
+        _REPORTED_DRAW_ERRORS.add(message)
+    print(f"[ZB-Nav] {message}")
 
 
 def get_nav_mode(context):
@@ -152,6 +184,172 @@ def location_on_depth(region, region_3d, mouse_x, mouse_y, depth_location):
         (mouse_x, mouse_y),
         depth_location,
     )
+
+
+def _brush_size_owner(context):
+    """Return (owner, property) for the brush size, honouring unified size."""
+    tool_settings = getattr(context, "tool_settings", None)
+    sculpt = getattr(tool_settings, "sculpt", None) if tool_settings else None
+    if sculpt is None:
+        return None, None
+    for unified in (
+        getattr(sculpt, "unified_paint_settings", None),
+        getattr(tool_settings, "unified_paint_settings", None),
+    ):
+        if unified is not None and getattr(unified, "use_unified_size", False):
+            return unified, "size"
+    brush = getattr(sculpt, "brush", None)
+    if brush is not None:
+        return brush, "size"
+    return None, None
+
+
+def _brush_size_limits(owner):
+    """Hard limits of the size property, so the drag can never reach zero."""
+    try:
+        prop = owner.bl_rna.properties["size"]
+        return int(prop.hard_min), int(prop.hard_max)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return BRUSH_SIZE_MIN_FALLBACK, BRUSH_SIZE_MAX_FALLBACK
+
+
+def _brush_size_value(context):
+    owner, name = _brush_size_owner(context)
+    if owner is None:
+        return None
+    try:
+        return int(getattr(owner, name))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _set_brush_size(context, value):
+    owner, name = _brush_size_owner(context)
+    if owner is None:
+        return False
+    low, high = _brush_size_limits(owner)
+    target = max(low, min(high, int(round(value))))
+    try:
+        setattr(owner, name, target)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _brush_size_sensitivity(context):
+    try:
+        return max(0.01, float(_pref(context, "brush_size_sensitivity", 0.5)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _brush_size_from_drag(context, start_size, delta_x):
+    """Turn one horizontal drag distance into a brush size.
+
+    The gear ratio grows with the brush so small and large brushes feel alike.
+    """
+    gear = _brush_size_sensitivity(context) * max(1.0, start_size / BRUSH_SIZE_BASE_RANGE)
+    return start_size + delta_x * gear
+
+
+def _trigger_key_type(context):
+    return "SPACE" if str(_pref(context, "trigger_key", "S")) == "SPACE" else "S"
+
+
+def _trigger_keymap_items(context):
+    """Keymap items for the brush size trigger, following the preference."""
+    trigger = _trigger_key_type(context)
+    return [
+        {
+            "keymap": "3D View",
+            "space_type": "VIEW_3D",
+            "idname": "zb_nav.brush_size_drag",
+            "type": trigger,
+            "value": "PRESS",
+            "properties": {},
+        },
+        {
+            "keymap": "Sculpt",
+            "space_type": "EMPTY",
+            "idname": "zb_nav.brush_size_drag",
+            "type": trigger,
+            "value": "PRESS",
+            "properties": {},
+        },
+    ]
+
+
+def _restore_trigger_key():
+    """Put every yielded native keymap item back exactly as it was."""
+    global _TRIGGER_KEY_YIELDED
+    saved = list(_TRIGGER_KEY_YIELDED_ITEMS)
+    _TRIGGER_KEY_YIELDED_ITEMS.clear()
+    _TRIGGER_KEY_YIELDED = None
+    for item, was_active in saved:
+        try:
+            item.active = was_active
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _yield_trigger_key(key_type):
+    """Free up one key so the brush size trigger can use it.
+
+    Only the keymaps this add-on can collide with are touched, only items
+    without modifiers are taken, and every change is remembered for restore.
+    """
+    global _TRIGGER_KEY_YIELDED
+    _restore_trigger_key()
+    if not key_type:
+        return
+    keyconfigs = getattr(bpy.context.window_manager, "keyconfigs", None)
+    keyconfig = getattr(keyconfigs, "user", None) if keyconfigs else None
+    if keyconfig is None:
+        return
+    for keymap in keyconfig.keymaps:
+        if keymap.name not in TRIGGER_KEYMAP_NAMES:
+            continue
+        for item in keymap.keymap_items:
+            if item.type != key_type or not item.active:
+                continue
+            if item.ctrl or item.alt or item.shift or item.oskey:
+                continue
+            if item.key_modifier != "NONE":
+                continue
+            if item.idname.startswith("zb_nav."):
+                continue
+            try:
+                _TRIGGER_KEY_YIELDED_ITEMS.append((item, item.active))
+                item.active = False
+            except (AttributeError, ReferenceError, RuntimeError):
+                continue
+    _TRIGGER_KEY_YIELDED = key_type
+
+
+def _sync_trigger_key_state():
+    """Only ever take the key while it can actually be used."""
+    context = bpy.context
+    if is_zbrush_sculpt_mode(context):
+        _yield_trigger_key(_trigger_key_type(context))
+    else:
+        _restore_trigger_key()
+
+
+def _trigger_key_sync_timer():
+    try:
+        _sync_trigger_key_state()
+    except Exception as exc:
+        _draw_error(bpy.context, "trigger key sync", exc)
+    return None
+
+
+def _schedule_trigger_key_sync():
+    """Keymap edits run from a timer, never from a draw or keymap callback."""
+    try:
+        if not bpy.app.timers.is_registered(_trigger_key_sync_timer):
+            bpy.app.timers.register(_trigger_key_sync_timer, first_interval=0.0)
+    except (AttributeError, ValueError):
+        pass
 
 
 def remove_zbrush_keymaps():
@@ -482,11 +680,8 @@ def _gizmo_world_axes(context):
 
 
 def _axis_pixels(context):
-    """On-screen length of the gizmo axes, in pixels."""
-    try:
-        return max(20.0, float(_pref(context, "axis_length", GIZMO_PIXEL_SIZE)))
-    except (TypeError, ValueError):
-        return GIZMO_PIXEL_SIZE
+    """On-screen length of the gizmo axes, in pixels, following the DPI scale."""
+    return max(20.0, _px(context, GIZMO_PIXEL_SIZE))
 
 
 def _gizmo_length(context):
@@ -526,7 +721,7 @@ def _gizmo_screen_reach(context):
     Used to reject far-away picks before doing the expensive projections.
     """
     offset = max(1.6, _button_offset(context))
-    return _axis_pixels(context) * offset + _button_size(context) + 24.0
+    return _axis_pixels(context) * offset + _button_size(context) + _px(context, 24.0)
 
 
 def _axis_drag_angle(context, origin, axis, previous, current):
@@ -597,10 +792,10 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 base_screen.x, base_screen.y,
                 tip_screen.x, tip_screen.y,
             )
-            candidates.append((d - GIZMO_MOVE_TRI_HALF_WID, "move", axis))
+            candidates.append((d - _px(context, GIZMO_MOVE_TRI_HALF_WID), "move", axis))
         if mid_screen:
             d = math.hypot(mouse_x - mid_screen.x, mouse_y - mid_screen.y)
-            candidates.append((d - 12.0, "scale", axis))
+            candidates.append((d - _px(context, 12.0), "scale", axis))
 
         radius = length * GIZMO_RING_RADIUS
         steps = 24
@@ -623,7 +818,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 )
                 for i in range(len(screen_points))
             )
-            candidates.append((best - 3.0, "rotate", axis))
+            candidates.append((best - _px(context, 3.0), "rotate", axis))
 
     # outer view-rotation ring (circle facing the camera)
     region_3d = context.region_data
@@ -648,7 +843,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
                 )
                 for i in range(len(screen_points))
             )
-            candidates.append((best - 3.0, "view_rotate", -1))
+            candidates.append((best - _px(context, 3.0), "view_rotate", -1))
 
         # four corner triangles: translate in the view plane
         corner_angles = (45, 135, 225, 315)
@@ -659,12 +854,12 @@ def _move_mode_pick(context, mouse_x, mouse_y):
             screen = _to_screen(context, world)
             if screen:
                 d = math.hypot(mouse_x - screen.x, mouse_y - screen.y)
-                candidates.append((d - 16.0, "view_move", corner))
+                candidates.append((d - _px(context, 16.0), "view_move", corner))
 
     # center square: uniform scale
     if origin_screen:
         d = math.hypot(mouse_x - origin_screen.x, mouse_y - origin_screen.y)
-        candidates.append((d - GIZMO_CENTER_SQUARE_HALF - 4.0, "scale_all", -1))
+        candidates.append((d - _px(context, GIZMO_CENTER_SQUARE_HALF + 4.0), "scale_all", -1))
 
         # three gizmo buttons above the pivot
         btn_size = _button_size(context)
@@ -674,7 +869,7 @@ def _move_mode_pick(context, mouse_x, mouse_y):
             candidates.append((d - btn_size, "gizmo_button", btn))
 
     candidates.sort(key=lambda item: item[0])
-    if candidates and candidates[0][0] < 6.0:
+    if candidates and candidates[0][0] < _px(context, 6.0):
         return candidates[0][1], candidates[0][2]
     return None
 
@@ -1221,10 +1416,95 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         return {"PASS_THROUGH"}
 
 
-def add_zbrush_keymaps():
+class ZBNAV_OT_brush_size_drag(bpy.types.Operator):
+    """按住触发键 + 左键左右拖动调整笔刷大小。"""
+
+    bl_idname = "zb_nav.brush_size_drag"
+    bl_label = "Brush Size Drag"
+    bl_description = "按住触发键再按住左键左右拖动，调整笔刷大小"
+    bl_options = {"INTERNAL"}
+
+    _start_mouse_x = 0
+    _start_size = 0
+    _dragging = False
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context) and _brush_size_owner(context)[0] is not None
+
+    def invoke(self, context, event):
+        global BRUSH_SIZE_DRAG_ACTIVE, BRUSH_SIZE_CENTER_X, BRUSH_SIZE_CENTER_Y
+        if event.type != _trigger_key_type(context) or event.value != "PRESS":
+            return {"PASS_THROUGH"}
+        size = _brush_size_value(context)
+        if size is None:
+            return {"PASS_THROUGH"}
+
+        self._start_size = size
+        self._start_mouse_x = event.mouse_region_x
+        self._dragging = False
+        BRUSH_SIZE_CENTER_X = float(event.mouse_region_x)
+        BRUSH_SIZE_CENTER_Y = float(event.mouse_region_y)
+        BRUSH_SIZE_DRAG_ACTIVE = True
+        context.window_manager.modal_handler_add(self)
+        if context.area:
+            context.area.tag_redraw()
+        return {"RUNNING_MODAL"}
+
+    def _finish(self, context):
+        global BRUSH_SIZE_DRAG_ACTIVE
+        BRUSH_SIZE_DRAG_ACTIVE = False
+        self._dragging = False
+        if context.area:
+            context.area.tag_redraw()
+        return {"FINISHED"}
+
+    def _cancel(self, context):
+        if self._dragging:
+            _set_brush_size(context, self._start_size)
+        return self._finish(context)
+
+    def modal(self, context, event):
+        global BRUSH_SIZE_CENTER_X, BRUSH_SIZE_CENTER_Y
+        trigger = _trigger_key_type(context)
+
+        if event.type == "ESC" and event.value == "PRESS":
+            return self._cancel(context)
+        if event.type == trigger and event.value == "RELEASE":
+            return self._finish(context)
+        if not is_zbrush_sculpt_mode(context):
+            return self._cancel(context)
+
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            # The circle stays where the drag actually starts.
+            BRUSH_SIZE_CENTER_X = float(event.mouse_region_x)
+            BRUSH_SIZE_CENTER_Y = float(event.mouse_region_y)
+            self._start_mouse_x = event.mouse_region_x
+            self._dragging = True
+            return {"RUNNING_MODAL"}
+
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            if self._dragging:
+                return self._finish(context)
+            return {"RUNNING_MODAL"}
+
+        if event.type == "MOUSEMOVE" and self._dragging:
+            delta_x = event.mouse_region_x - self._start_mouse_x
+            target = _brush_size_from_drag(context, self._start_size, delta_x)
+            if _set_brush_size(context, target) and context.area:
+                context.area.tag_redraw()
+            return {"RUNNING_MODAL"}
+
+        return {"RUNNING_MODAL"}
+
+
+def add_zbrush_keymaps(context=None):
+    context = context or bpy.context
     remove_zbrush_keymaps()
     swap_sculpt_brush_modifiers()
     for item in ZBRUSH_KEYMAP_ITEMS:
+        _add_keymap_item(item)
+    for item in _trigger_keymap_items(context):
         _add_keymap_item(item)
 
 
@@ -1244,6 +1524,7 @@ def update_navigation_mode(context, mode):
         MOVE_MODE_HOVER = None
     set_nav_mode(context, mode)
     tag_all_view3d_areas_for_redraw()
+    _schedule_trigger_key_sync()
     return True
 
 
@@ -1251,11 +1532,7 @@ _SCULPT_MODE_LAST_STATE = None
 
 
 def _sculpt_mode_handler(scene, depsgraph):
-    """Keep the sub-mode and its hover monitor in sync when entering sculpt mode.
-
-    The ZBrush switch is only turned on by itself when the user opted in
-    through the "自动开启" preference; otherwise it stays manual.
-    """
+    """Keep the sub-mode, its hover monitor and the trigger key in sync."""
     global _SCULPT_MODE_LAST_STATE
     context = bpy.context
     is_sculpt = context.mode == "SCULPT"
@@ -1263,17 +1540,45 @@ def _sculpt_mode_handler(scene, depsgraph):
         return
     _SCULPT_MODE_LAST_STATE = is_sculpt
 
-    if not is_sculpt:
-        return
-    if is_navigation_enabled(context) or _pref(context, "auto_enable_in_sculpt", False):
+    if is_sculpt and is_navigation_enabled(context):
         try:
             update_navigation_mode(context, "ZBRUSH")
         except Exception as exc:
             _draw_error(context, "sculpt mode handler", exc)
+    _schedule_trigger_key_sync()
+
+
+def _on_trigger_key_changed(self, context):
+    """Re-register the trigger keymap and free up the newly chosen key."""
+    try:
+        add_zbrush_keymaps(context)
+    except Exception as exc:
+        _draw_error(context, "trigger key update", exc)
+    _schedule_trigger_key_sync()
 
 
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
+
+    trigger_key: EnumProperty(
+        name="触发键",
+        description="按住它再按住左键左右拖动，即可调整笔刷大小",
+        items=TRIGGER_KEY_ITEMS,
+        default="S",
+        update=_on_trigger_key_changed,
+    )
+
+    brush_size_sensitivity: FloatProperty(
+        name="笔刷灵敏度",
+        description="每像素拖动改变多少笔刷大小（相对当前大小）",
+        default=0.5,
+        min=0.05,
+        max=5.0,
+        soft_min=0.1,
+        soft_max=2.0,
+        step=1,
+        precision=2,
+    )
 
     pan_sensitivity: FloatProperty(
         name="Pan Sensitivity",
@@ -1297,98 +1602,6 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
-    zoom_direction_invert: BoolProperty(
-        name="反向缩放",
-        description="勾选后鼠标移动方向与缩放方向相反",
-        default=False,
-    )
-
-    enable_pan_to_zoom: BoolProperty(
-        name="松开 Alt 切换为缩放",
-        description="Alt + 中键拖动过程中松开 Alt 时，把这次拖动转成缩放；关闭则始终平移",
-        default=True,
-    )
-
-    alt_drag_orbits_view: BoolProperty(
-        name="Alt + 左键拖动旋转视图",
-        description="点击仍切换雕刻对象，拖动则旋转视图；关闭后按下即切换",
-        default=True,
-    )
-
-    alt_drag_threshold: IntProperty(
-        name="拖动判定",
-        description="Alt + 左键移动超过这个像素距离才算拖动，用来避免误触发切换",
-        default=6,
-        min=0,
-        max=40,
-    )
-
-    axis_length: IntProperty(
-        name="控制轴长度",
-        description="控制轴在屏幕上的长度（像素）",
-        default=int(GIZMO_PIXEL_SIZE),
-        min=40,
-        max=300,
-    )
-
-    button_offset: FloatProperty(
-        name="按钮高度",
-        description="三个轴心按钮距控制轴中心的高度（以轴长为倍数）",
-        default=GIZMO_BUTTON_Y_OFFSET,
-        min=0.6,
-        max=3.0,
-        soft_min=0.8,
-        soft_max=2.0,
-        step=10,
-    )
-
-    button_spacing: IntProperty(
-        name="按钮间距",
-        description="三个轴心按钮之间的水平间距（像素）",
-        default=int(GIZMO_BUTTON_SPACING),
-        min=8,
-        max=80,
-    )
-
-    button_size: IntProperty(
-        name="按钮大小",
-        description="轴心按钮的尺寸（像素）",
-        default=int(GIZMO_BUTTON_RADIUS),
-        min=4,
-        max=30,
-    )
-
-    show_arrows: BoolProperty(
-        name="轴向箭头",
-        description="显示三个轴向的移动箭头与缩放矩形",
-        default=True,
-    )
-    show_axis_rings: BoolProperty(
-        name="轴向旋转环",
-        description="显示三条轴向旋转环",
-        default=True,
-    )
-    show_view_ring: BoolProperty(
-        name="视图旋转外圈",
-        description="显示最外圈的视图旋转环",
-        default=True,
-    )
-    show_corner_handles: BoolProperty(
-        name="四角平移手柄",
-        description="显示四个角的视图平移三角",
-        default=True,
-    )
-    show_center_handle: BoolProperty(
-        name="中心方块",
-        description="显示中心方块的等比缩放手柄",
-        default=True,
-    )
-    show_pivot_buttons: BoolProperty(
-        name="轴心按钮",
-        description="显示轴心上方的三个轴心预设按钮",
-        default=True,
-    )
-
     axis_color_x: FloatVectorProperty(
         name="X 轴颜色",
         description="控制轴 X 轴颜色",
@@ -1407,82 +1620,24 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         default=(0.07, 0.18, 0.48),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
-    ring_color: FloatVectorProperty(
-        name="外圈与旋转环颜色",
-        description="视图旋转外圈与轴向旋转环的颜色",
-        default=GIZMO_HANDLE_COLOR,
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-    corner_color: FloatVectorProperty(
-        name="四角手柄颜色",
-        description="四个角的视图平移三角颜色",
-        default=GIZMO_HANDLE_COLOR,
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-    button_icon_color: FloatVectorProperty(
-        name="按钮图标颜色",
-        description="三个轴心按钮的图标颜色（悬停时变为白色）",
-        default=GIZMO_BUTTON_COLOR,
-        min=0.0, max=1.0, size=3, subtype="COLOR",
-    )
-
-    auto_enable_in_sculpt: BoolProperty(
-        name="进入雕刻模式时自动开启",
-        description="进入雕刻模式时自动打开 ZBrush 子模式；默认关闭，由标题栏按钮手动控制",
-        default=False,
-    )
-
-    debug_output: BoolProperty(
-        name="调试输出",
-        description="把控制轴绘制中捕获到的异常打印到系统控制台",
-        default=False,
-    )
 
     def draw(self, context):
         layout = self.layout
+        layout.use_property_split = False
 
-        nav_box = layout.box()
-        nav_box.label(text="导航（Alt + 中键）")
-        nav_box.prop(self, "pan_sensitivity")
-        nav_box.prop(self, "zoom_sensitivity")
-        nav_box.prop(self, "enable_pan_to_zoom")
-        nav_box.prop(self, "zoom_direction_invert")
+        column = layout.column(align=True)
+        row = column.row(align=True)
+        row.prop(self, "trigger_key", text="触发键")
+        row.prop(self, "brush_size_sensitivity", text="笔刷", slider=True)
+        row = column.row(align=True)
+        row.prop(self, "pan_sensitivity", text="平移", slider=True)
+        row.prop(self, "zoom_sensitivity", text="视图缩放", slider=True)
 
-        switch_box = layout.box()
-        switch_box.label(text="切换物体（Alt + 左键）")
-        switch_box.prop(self, "alt_drag_orbits_view")
-        threshold_row = switch_box.row()
-        threshold_row.enabled = self.alt_drag_orbits_view
-        threshold_row.prop(self, "alt_drag_threshold")
-
-        gizmo_box = layout.box()
-        gizmo_box.label(text="控制轴")
-        gizmo_box.prop(self, "axis_length")
-        gizmo_box.prop(self, "button_offset")
-        gizmo_box.prop(self, "button_spacing")
-        gizmo_box.prop(self, "button_size")
-        gizmo_box.label(text="显示部件")
-        show_column = gizmo_box.column(align=True)
-        show_column.prop(self, "show_arrows")
-        show_column.prop(self, "show_axis_rings")
-        show_column.prop(self, "show_view_ring")
-        show_column.prop(self, "show_corner_handles")
-        show_column.prop(self, "show_center_handle")
-        show_column.prop(self, "show_pivot_buttons")
-        gizmo_box.label(text="颜色")
-        color_row = gizmo_box.row(align=True)
-        color_row.prop(self, "axis_color_x", text="")
-        color_row.prop(self, "axis_color_y", text="")
-        color_row.prop(self, "axis_color_z", text="")
-        color_row.prop(self, "ring_color", text="")
-        color_row.prop(self, "corner_color", text="")
-        color_row.prop(self, "button_icon_color", text="")
-
-        misc_box = layout.box()
-        misc_box.label(text="其他")
-        misc_box.prop(self, "auto_enable_in_sculpt")
-        misc_box.prop(self, "debug_output")
-
+        row = layout.row(align=True)
+        row.label(text="轴色")
+        row.prop(self, "axis_color_x", text="X")
+        row.prop(self, "axis_color_y", text="Y")
+        row.prop(self, "axis_color_z", text="Z")
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
     bl_idname = "zb_nav.pan_or_zoom"
@@ -1545,7 +1700,7 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
                 dx = current_x - self._last_mouse_x
                 dy = current_y - self._last_mouse_y
 
-                if event.alt or not _pref(context, "enable_pan_to_zoom", True):
+                if event.alt:
                     self._pan_view(context, current_x, current_y)
                 else:
                     if self._was_alt_pressed and not self._converted_pan_to_zoom:
@@ -1610,8 +1765,6 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
         # Blender's region Y coordinate increases upward; invert it so screen-down
         # contributes in the same direction as screen-right, matching ZBrush.
         delta = dx - dy
-        if _pref(context, "zoom_direction_invert", False):
-            delta = -delta
         zoom_factor = math.exp(-delta * 0.01 * sensitivity)
         new_distance = max(previous_distance * zoom_factor, 0.0001)
         ratio = new_distance / previous_distance
@@ -1641,9 +1794,6 @@ class ZBNAV_OT_alt_select_target(bpy.types.Operator):
     def invoke(self, context, event):
         if not (event.alt and event.type == "LEFTMOUSE" and event.value == "PRESS"):
             return {"PASS_THROUGH"}
-        if not _pref(context, "alt_drag_orbits_view", True):
-            return select_or_invert_sculpt_target(context, event)
-
         self._press_x = event.mouse_region_x
         self._press_y = event.mouse_region_y
         self._last_x = event.mouse_region_x
@@ -1651,12 +1801,6 @@ class ZBNAV_OT_alt_select_target(bpy.types.Operator):
         self._orbiting = False
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
-
-    def _threshold(self, context):
-        try:
-            return int(_pref(context, "alt_drag_threshold", 6))
-        except (TypeError, ValueError):
-            return 6
 
     def _orbit_view(self, context, event):
         """Orbit the view around its pivot so the model follows the cursor."""
@@ -1686,10 +1830,9 @@ class ZBNAV_OT_alt_select_target(bpy.types.Operator):
     def modal(self, context, event):
         if event.type == "MOUSEMOVE":
             if not self._orbiting:
-                threshold = self._threshold(context)
                 if (
-                    abs(event.mouse_region_x - self._press_x) > threshold
-                    or abs(event.mouse_region_y - self._press_y) > threshold
+                    abs(event.mouse_region_x - self._press_x) > ALT_DRAG_THRESHOLD
+                    or abs(event.mouse_region_y - self._press_y) > ALT_DRAG_THRESHOLD
                 ):
                     self._orbiting = True
             if self._orbiting:
@@ -1781,19 +1924,13 @@ def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=3
     _draw_polyline_2d(shader, points, color)
 
 
-def _button_offset(context):
+def _button_offset(_context):
     """Pivot button height as a multiple of the gizmo's on-screen pixel length."""
-    try:
-        return max(0.6, float(_pref(context, "button_offset", GIZMO_BUTTON_Y_OFFSET)))
-    except (TypeError, ValueError):
-        return GIZMO_BUTTON_Y_OFFSET
+    return GIZMO_BUTTON_Y_OFFSET
 
 
 def _button_spacing(context):
-    try:
-        return float(_pref(context, "button_spacing", GIZMO_BUTTON_SPACING))
-    except (TypeError, ValueError):
-        return GIZMO_BUTTON_SPACING
+    return _px(context, GIZMO_BUTTON_SPACING)
 
 
 def _gizmo_button_positions(context, origin_screen):
@@ -1808,18 +1945,11 @@ def _gizmo_button_positions(context, origin_screen):
 
 
 def _button_size(context):
-    try:
-        return float(_pref(context, "button_size", GIZMO_BUTTON_RADIUS))
-    except (TypeError, ValueError):
-        return GIZMO_BUTTON_RADIUS
+    return _px(context, GIZMO_BUTTON_RADIUS)
 
 
-def _button_color(context):
-    value = _pref(context, "button_icon_color", GIZMO_BUTTON_COLOR)
-    try:
-        return (float(value[0]), float(value[1]), float(value[2]))
-    except (TypeError, IndexError, ValueError):
-        return GIZMO_BUTTON_COLOR
+def _button_color(_context):
+    return GIZMO_BUTTON_COLOR
 
 
 def _draw_button_icon(shader, cx, cy, kind, hover, size, color):
@@ -1871,15 +2001,19 @@ def _draw_gizmo_button_tooltip(shader, context, button_index, bx, by, button_siz
         return
     title, detail = GIZMO_BUTTON_TOOLTIPS[button_index]
     font_id = 0
-    x = min(max(bx + button_size + 8.0, 8.0), max(region.width - 180.0, 8.0))
-    y = by + 5.0
-    blf.size(font_id, 12)
+    ui = _ui_scale(context)
+    x = min(
+        max(bx + button_size + 8.0 * ui, 8.0 * ui),
+        max(region.width - 180.0 * ui, 8.0 * ui),
+    )
+    y = by + 5.0 * ui
+    blf.size(font_id, int(12 * ui))
     blf.color(font_id, 1.0, 1.0, 1.0, 0.95)
     blf.position(font_id, x, y, 0)
     blf.draw(font_id, title)
-    blf.size(font_id, 10)
+    blf.size(font_id, int(10 * ui))
     blf.color(font_id, 0.72, 0.76, 0.82, 0.9)
-    blf.position(font_id, x, y - 15.0, 0)
+    blf.position(font_id, x, y - 15.0 * ui, 0)
     blf.draw(font_id, detail)
 
 
@@ -1995,14 +2129,18 @@ def draw_move_mode_gizmo():
         return
 
     hover = MOVE_MODE_HOVER
-    show_arrows = bool(_pref(context, "show_arrows", True))
-    show_axis_rings = bool(_pref(context, "show_axis_rings", True))
-    show_view_ring = bool(_pref(context, "show_view_ring", True))
-    show_corner_handles = bool(_pref(context, "show_corner_handles", True))
-    show_center_handle = bool(_pref(context, "show_center_handle", True))
-    show_pivot_buttons = bool(_pref(context, "show_pivot_buttons", True))
-    handle_color = _pref_color(context, "ring_color", GIZMO_HANDLE_COLOR)
-    corner_base_color = _pref_color(context, "corner_color", GIZMO_HANDLE_COLOR)
+    # Every handle is drawn: the visibility preferences were dropped when the
+    # panel was trimmed to the brush size settings.
+    show_arrows = True
+    show_axis_rings = True
+    show_view_ring = True
+    show_corner_handles = True
+    show_center_handle = True
+    show_pivot_buttons = True
+    handle_color = (GIZMO_HANDLE_COLOR[0], GIZMO_HANDLE_COLOR[1], GIZMO_HANDLE_COLOR[2], 1.0)
+    corner_base_color = (
+        GIZMO_HANDLE_COLOR[0], GIZMO_HANDLE_COLOR[1], GIZMO_HANDLE_COLOR[2], 1.0
+    )
 
     def accent(base, kind):
         if hover and hover[1] == axis and hover[0] == kind:
@@ -2028,7 +2166,7 @@ def draw_move_mode_gizmo():
                         (tip_screen.x, tip_screen.y),
                         (base_screen.x, base_screen.y),
                         accent(color, "move"),
-                        GIZMO_MOVE_TRI_HALF_WID,
+                        _px(context, GIZMO_MOVE_TRI_HALF_WID),
                     )
 
                 if mid_screen and tip_screen:
@@ -2037,8 +2175,8 @@ def draw_move_mode_gizmo():
                         (mid_screen.x, mid_screen.y),
                         (tip_screen.x - origin_screen.x, tip_screen.y - origin_screen.y),
                         accent(color, "scale"),
-                        GIZMO_SCALE_RECT_LEN,
-                        GIZMO_SCALE_RECT_WID,
+                        _px(context, GIZMO_SCALE_RECT_LEN),
+                        _px(context, GIZMO_SCALE_RECT_WID),
                     )
 
             if show_axis_rings:
@@ -2057,8 +2195,8 @@ def draw_move_mode_gizmo():
                     other1,
                     other2,
                     radius,
-                    length * (GIZMO_RING_TUBE_W / axis_pixels),
-                    length * (GIZMO_RING_TUBE_H / axis_pixels),
+                    length * (_px(context, GIZMO_RING_TUBE_W) / axis_pixels),
+                    length * (_px(context, GIZMO_RING_TUBE_H) / axis_pixels),
                     view_dir,
                     axis_ring_color,
                 )
@@ -2071,7 +2209,7 @@ def draw_move_mode_gizmo():
             view_right = region_3d.view_rotation @ mathutils.Vector((1, 0, 0))
             view_up = region_3d.view_rotation @ mathutils.Vector((0, 1, 0))
             outer_radius = length * GIZMO_VIEW_RING_RADIUS
-            band_world = length * (GIZMO_RING_BAND_PX / axis_pixels)
+            band_world = length * (_px(context, GIZMO_RING_BAND_PX) / axis_pixels)
 
             if show_view_ring:
                 inner_points = []
@@ -2093,8 +2231,8 @@ def draw_move_mode_gizmo():
                 # four squat triangles farther out: translate in the view plane
                 corner_angles = (45, 135, 225, 315)
                 corner_radius = length * GIZMO_CORNER_RADIUS
-                tri_height = GIZMO_CORNER_TRI_HEIGHT
-                tri_half_wid = GIZMO_CORNER_TRI_HALF_WID
+                tri_height = _px(context, GIZMO_CORNER_TRI_HEIGHT)
+                tri_half_wid = _px(context, GIZMO_CORNER_TRI_HALF_WID)
                 for corner in range(4):
                     rad = math.radians(corner_angles[corner])
                     world = origin + (view_right * math.cos(rad) + view_up * math.sin(rad)) * corner_radius
@@ -2129,7 +2267,13 @@ def draw_move_mode_gizmo():
                 if tip_screen and base_screen:
                     arrow_color = accent(color, "move")
                     _draw_line_2d(shader, (origin_screen.x, origin_screen.y), (tip_screen.x, tip_screen.y), arrow_color)
-                    _draw_tri_along_axis(shader, (tip_screen.x, tip_screen.y), (base_screen.x, base_screen.y), arrow_color, GIZMO_MOVE_TRI_HALF_WID)
+                    _draw_tri_along_axis(
+                        shader,
+                        (tip_screen.x, tip_screen.y),
+                        (base_screen.x, base_screen.y),
+                        arrow_color,
+                        _px(context, GIZMO_MOVE_TRI_HALF_WID),
+                    )
             except Exception as exc:
                 _draw_error(context, "gizmo arrows", exc)
 
@@ -2137,7 +2281,7 @@ def draw_move_mode_gizmo():
     if show_center_handle:
         try:
             center_color = (1.0, 1.0, 1.0, 1.0)
-            half = GIZMO_CENTER_SQUARE_HALF
+            half = _px(context, GIZMO_CENTER_SQUARE_HALF)
             cx, cy = origin_screen.x, origin_screen.y
             verts = [
                 (cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half),
@@ -2173,11 +2317,72 @@ def draw_move_mode_gizmo():
     gpu.state.blend_set("NONE")
 
 
+def draw_brush_size_overlay():
+    """Brush size circle plus readout, anchored where the drag started."""
+    if not BRUSH_SIZE_DRAG_ACTIVE:
+        return
+    context = bpy.context
+    if not is_zbrush_sculpt_mode(context):
+        return
+    region = context.region
+    if not region or region.type != "WINDOW":
+        return
+    size = _brush_size_value(context)
+    if size is None:
+        return
+
+    ui = _ui_scale(context)
+    try:
+        pixel_size = max(0.5, float(context.preferences.system.pixel_size))
+    except (AttributeError, TypeError, ValueError):
+        pixel_size = 1.0
+    # Blender draws its own brush cursor at size/2 * pixel_size, so match it.
+    radius = max(2.0, size * 0.5 * pixel_size)
+    center_x = BRUSH_SIZE_CENTER_X
+    center_y = BRUSH_SIZE_CENTER_Y
+    circle_color = (1.0, 0.85, 0.2, 0.95)
+    cross_color = (1.0, 0.85, 0.2, 0.3)
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    try:
+        _draw_circle_outline_2d(
+            shader, (center_x, center_y), radius, circle_color, 1.5 * ui
+        )
+        _draw_line_2d(
+            shader,
+            (center_x - radius, center_y),
+            (center_x + radius, center_y),
+            cross_color,
+        )
+        _draw_line_2d(
+            shader,
+            (center_x, center_y - radius),
+            (center_x, center_y + radius),
+            cross_color,
+        )
+    except Exception as exc:
+        _draw_error(context, "brush size circle", exc)
+
+    font_id = 0
+    blf.size(font_id, int(13 * ui))
+    blf.color(font_id, 1.0, 0.85, 0.2, 1.0)
+    blf.position(font_id, center_x + radius + 8.0 * ui, center_y + 4.0 * ui, 0)
+    blf.draw(font_id, f"{size} px")
+    gpu.state.blend_set("NONE")
+
+
+def draw_zb_overlays():
+    """The single POST_PIXEL handler: move gizmo plus brush size readout."""
+    draw_move_mode_gizmo()
+    draw_brush_size_overlay()
+
+
 def register_view3d_draw_handler():
     global VIEW3D_DRAW_HANDLER
     if VIEW3D_DRAW_HANDLER is None:
         VIEW3D_DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
-            draw_move_mode_gizmo,
+            draw_zb_overlays,
             (),
             "WINDOW",
             "POST_PIXEL",
@@ -2228,6 +2433,7 @@ CLASSES = (
     ZBNAV_AddonPreferences,
     ZBNAV_OT_pan_or_zoom,
     ZBNAV_OT_alt_select_target,
+    ZBNAV_OT_brush_size_drag,
     ZBNAV_OT_set_navigation_mode,
     ZBNAV_OT_gizmo_hover_monitor,
     ZBNAV_OT_move_mode_drag,
@@ -2247,11 +2453,18 @@ def register():
 
 
 def unregister():
-    global GIZMO_HOVER_MONITOR_RUNNING
+    global GIZMO_HOVER_MONITOR_RUNNING, BRUSH_SIZE_DRAG_ACTIVE
     GIZMO_HOVER_MONITOR_RUNNING = False
+    BRUSH_SIZE_DRAG_ACTIVE = False
     if bpy.app.handlers.depsgraph_update_post.count(_sculpt_mode_handler):
         bpy.app.handlers.depsgraph_update_post.remove(_sculpt_mode_handler)
+    try:
+        if bpy.app.timers.is_registered(_trigger_key_sync_timer):
+            bpy.app.timers.unregister(_trigger_key_sync_timer)
+    except (AttributeError, ValueError):
+        pass
     remove_zbrush_keymaps()
+    _restore_trigger_key()
     restore_sculpt_brush_modifiers()
     unregister_view3d_draw_handler()
     if hasattr(bpy.context, "window_manager"):
