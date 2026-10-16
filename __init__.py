@@ -1,64 +1,32 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 15, 29),
+    "version": (1, 16, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
     "category": "3D View",
 }
 
-import logging
 import math
-import os
 
 import blf
-import bmesh
 import bpy
 import gpu
 import mathutils
-from bpy.props import FloatProperty, FloatVectorProperty, PointerProperty
+from bpy.props import FloatProperty, FloatVectorProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
 ADDON_KEYMAPS = []
 SCULPT_BRUSH_MODIFIERS = []
-SCULPT_ALT_LEFT_CONFLICTS = []
-VIEW_ROTATE_SNAP_KEYMAPS = []
-SPACE_KEYMAP_CONFLICTS = []
 NAV_MODE_PROP = "zb_nav_mode"
 HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 VIEW3D_DRAW_HANDLER = None
-BRUSH_SIZE_OVERLAY_HANDLER = None
-CTRL_HIT_STATUS_HANDLER = None
-CTRL_DIAGNOSTIC_RUNNING = False
-BRUSH_SIZE_OVERLAY_ACTIVE = False
-CTRL_HIT_STATUS = "等待 Ctrl + 左键"
-CTRL_HIT_STATUS_X = 0
-CTRL_HIT_STATUS_Y = 0
-CTRL_LASSO_POINTS = []
 MOVE_MODE_HOVER = None
+GIZMO_HOVER_MONITOR_RUNNING = False
 
-_LOG = logging.getLogger("ZB-Nav")
-_LOG.setLevel(logging.INFO)
-if not _LOG.handlers:
-    _handler = logging.FileHandler(
-        os.path.join(os.path.expanduser("~"), "zb_nav_ctrl.log"),
-        encoding="utf-8",
-    )
-    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    _LOG.addHandler(_handler)
-
-
-def _ctrl_log(message, *args):
-    _LOG.info(message, *args)
-
-
-def _ctrl_log_exception(message, *args):
-    _LOG.exception(message, *args)
 MOVE_GIZMO_PIVOT = None
-MAX_BRUSH_SIZE = 5000
-
 ZBRUSH_KEYMAP_ITEMS = [
     {
         "keymap": "3D View",
@@ -72,16 +40,6 @@ ZBRUSH_KEYMAP_ITEMS = [
     {
         "keymap": "3D View",
         "space_type": "VIEW_3D",
-        "idname": "zb_nav.alt_select_or_invert",
-        "type": "MIDDLEMOUSE",
-        "value": "PRESS",
-        "ctrl": True,
-        "shift": True,
-        "properties": {},
-    },
-    {
-        "keymap": "3D View",
-        "space_type": "VIEW_3D",
         "idname": "zb_nav.alt_select_target",
         "type": "LEFTMOUSE",
         "value": "PRESS",
@@ -95,22 +53,6 @@ ZBRUSH_KEYMAP_ITEMS = [
         "type": "LEFTMOUSE",
         "value": "PRESS",
         "alt": True,
-        "properties": {},
-    },
-    {
-        "keymap": "3D View",
-        "space_type": "VIEW_3D",
-        "idname": "zb_nav.space_brush_size",
-        "type": "SPACE",
-        "value": "PRESS",
-        "properties": {},
-    },
-    {
-        "keymap": "Sculpt",
-        "space_type": "EMPTY",
-        "idname": "zb_nav.space_brush_size",
-        "type": "SPACE",
-        "value": "PRESS",
         "properties": {},
     },
 ]
@@ -128,23 +70,6 @@ def get_nav_mode(context):
 
 def is_navigation_enabled(context):
     return context.window_manager.get(NAV_MODE_PROP, "BLENDER") == "ZBRUSH"
-
-
-def get_brush_size_owner(context):
-    sculpt = context.tool_settings.sculpt
-    brush = sculpt.brush if sculpt else None
-    if not brush:
-        return None, None
-
-    unified = getattr(sculpt, "unified_paint_settings", None)
-    if unified is None:
-        unified = getattr(context.tool_settings, "unified_paint_settings", None)
-    if unified is not None and getattr(unified, "use_unified_size", False):
-        if hasattr(unified, "size"):
-            return unified, "size"
-    if hasattr(brush, "size"):
-        return brush, "size"
-    return None, None
 
 
 def set_nav_mode(context, mode):
@@ -240,7 +165,6 @@ def _add_keymap_item(item):
 
 def swap_sculpt_brush_modifiers():
     restore_sculpt_brush_modifiers()
-    SCULPT_ALT_LEFT_CONFLICTS.clear()
     wm = bpy.context.window_manager
     keyconfig = wm.keyconfigs.user
     if not keyconfig:
@@ -259,7 +183,6 @@ def swap_sculpt_brush_modifiers():
         if keymap_item.alt and not keymap_item.ctrl:
             SCULPT_BRUSH_MODIFIERS.append((keymap_item, keymap_item.ctrl, keymap_item.alt))
             keymap_item.active = False
-            SCULPT_ALT_LEFT_CONFLICTS.append(keymap_item)
 
 
 def restore_sculpt_brush_modifiers():
@@ -271,86 +194,6 @@ def restore_sculpt_brush_modifiers():
         except (ReferenceError, RuntimeError):
             pass
     SCULPT_BRUSH_MODIFIERS.clear()
-    SCULPT_ALT_LEFT_CONFLICTS.clear()
-
-
-def suspend_plain_space_keymaps():
-    restore_plain_space_keymaps()
-    wm = bpy.context.window_manager
-    keyconfig = wm.keyconfigs.user
-    if not keyconfig:
-        return
-
-    for keymap in keyconfig.keymaps:
-        for keymap_item in keymap.keymap_items:
-            if keymap_item.type != "SPACE" or not keymap_item.active:
-                continue
-            if keymap_item.ctrl or keymap_item.shift or keymap_item.alt or keymap_item.oskey:
-                continue
-            if keymap_item.key_modifier != "NONE":
-                continue
-            try:
-                SPACE_KEYMAP_CONFLICTS.append((keymap_item, keymap_item.active))
-                keymap_item.active = False
-            except (AttributeError, ReferenceError, RuntimeError):
-                continue
-
-
-def restore_plain_space_keymaps():
-    saved_keymaps = list(SPACE_KEYMAP_CONFLICTS)
-    SPACE_KEYMAP_CONFLICTS.clear()
-    for keymap_item, active in saved_keymaps:
-        try:
-            keymap_item.active = active
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-            pass
-
-
-def remap_view_rotate_axis_snap():
-    restore_view_rotate_axis_snap()
-    wm = bpy.context.window_manager
-
-    for keyconfig in (wm.keyconfigs.user, wm.keyconfigs.default):
-        if not keyconfig:
-            continue
-        modal_keymap = keyconfig.keymaps.get("View3D Rotate Modal")
-        if not modal_keymap:
-            continue
-
-        for keymap_item in modal_keymap.keymap_items:
-            if not keymap_item.propvalue.startswith("AXIS_SNAP"):
-                continue
-            original_state = (
-                keymap_item,
-                keymap_item.type,
-                keymap_item.value,
-                keymap_item.alt,
-                keymap_item.shift,
-                keymap_item.ctrl,
-            )
-            try:
-                keymap_item.type = "LEFT_SHIFT"
-                keymap_item.alt = False
-                keymap_item.shift = False
-                keymap_item.ctrl = False
-            except (AttributeError, ReferenceError, RuntimeError):
-                continue
-            VIEW_ROTATE_SNAP_KEYMAPS.append(original_state)
-
-
-def restore_view_rotate_axis_snap():
-    saved_keymaps = list(VIEW_ROTATE_SNAP_KEYMAPS)
-    VIEW_ROTATE_SNAP_KEYMAPS.clear()
-    for keymap_item, event_type, value, alt, shift, ctrl in saved_keymaps:
-        try:
-            keymap_item.type = event_type
-            keymap_item.value = value
-            keymap_item.alt = alt
-            keymap_item.shift = shift
-            keymap_item.ctrl = ctrl
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-            # KeyMapItems can become invalid when Blender rebuilds a keymap.
-            pass
 
 
 def find_object_under_mouse(context, mouse_x, mouse_y):
@@ -386,10 +229,6 @@ def is_valid_sculpt_target(context, obj):
     return True
 
 
-def sculpt_target_poll(self, obj):
-    return is_valid_sculpt_target(bpy.context, obj)
-
-
 def switch_sculpt_target(context, target_object):
     if not is_zbrush_sculpt_mode(context):
         return False, "请先在雕刻模式中启用 ZBrush 子模式"
@@ -411,7 +250,6 @@ def switch_sculpt_target(context, target_object):
     except RuntimeError as exc:
         return False, f"无法切换到目标雕刻模式: {exc}"
 
-    context.window_manager.zb_nav_sculpt_target = target_object
     tag_all_view3d_areas_for_redraw()
     return True, f"已切换到 {target_object.name}"
 
@@ -426,68 +264,6 @@ def select_or_invert_sculpt_target(context, event):
 
     success, _message = switch_sculpt_target(context, hit_object)
     return {"FINISHED"} if success else {"CANCELLED"}
-
-
-def _point_in_polygon(x, y, points):
-    inside = False
-    n = len(points)
-    j = n - 1
-    for i in range(n):
-        xi, yi = points[i]
-        xj, yj = points[j]
-        if (yi > y) != (yj > y):
-            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
-            if x < x_intersect:
-                inside = not inside
-        j = i
-    return inside
-
-
-LASSO_CLICK_MAX_DISTANCE = 6.0
-LASSO_MIN_POINTS = 3
-
-
-def _is_lasso_click(points):
-    if len(points) < LASSO_MIN_POINTS:
-        return True
-    x0, y0 = points[0]
-    return all(abs(x - x0) <= LASSO_CLICK_MAX_DISTANCE and abs(y - y0) <= LASSO_CLICK_MAX_DISTANCE for x, y in points)
-
-
-def _lasso_covers_object(context, points):
-    obj = context.active_object
-    if not obj or obj.type != "MESH":
-        return False
-    region = context.region
-    region_3d = context.region_data
-    if not region or not region_3d:
-        return False
-
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-
-    deps = context.evaluated_depsgraph_get()
-    eval_obj = deps.objects.get(obj.name, obj)
-    mesh = eval_obj.data
-    verts = mesh.vertices
-    count = len(verts)
-    if count == 0:
-        return False
-
-    stride = max(1, count // 20000)
-    matrix = eval_obj.matrix_world
-    for i in range(0, count, stride):
-        world = matrix @ verts[i].co
-        screen = view3d_utils.location_3d_to_region_2d(region, region_3d, world)
-        if screen is None:
-            continue
-        sx, sy = screen.x, screen.y
-        if min_x <= sx <= max_x and min_y <= sy <= max_y:
-            if _point_in_polygon(sx, sy, points):
-                return True
-    return False
 
 
 MOVE_AXIS_COLORS = ((0.42, 0.055, 0.055), (0.055, 0.42, 0.08), (0.07, 0.18, 0.48))
@@ -520,7 +296,7 @@ GIZMO_CORNER_TRI_HEIGHT = 22.0
 GIZMO_CORNER_TRI_HALF_WID = 22.0
 GIZMO_BUTTON_RADIUS = 10.0
 GIZMO_BUTTON_SPACING = 26.0
-GIZMO_BUTTON_Y_OFFSET = 30.0
+GIZMO_BUTTON_Y_OFFSET = 1.15
 GIZMO_BUTTON_TOOLTIPS = (
     ("重置轴向", "恢复世界方向，保留轴心位置"),
     ("回到物体原点", "轴心位置和方向匹配物体原点"),
@@ -605,53 +381,6 @@ def _mesh_vertex_mask(obj, vertex_index):
         except (AttributeError, TypeError, ValueError):
             pass
     return 0.0
-
-
-def _ensure_sculpt_mask_attribute(obj):
-    if not obj or obj.type != "MESH" or not obj.data:
-        return None
-    attributes = obj.data.attributes
-    mask_layer = attributes.get(".sculpt_mask")
-    if mask_layer is None:
-        try:
-            mask_layer = attributes.new(".sculpt_mask", "FLOAT", "POINT")
-        except (RuntimeError, TypeError):
-            return None
-    return mask_layer
-
-
-def _apply_loop_auto_mask(context, mouse_x, mouse_y):
-    obj = context.active_object
-    if not obj or obj.type != "MESH":
-        return False
-    region = context.region
-    region_3d = context.region_data
-    if not region or not region_3d:
-        return False
-    hit, location, _normal, _index, hit_obj, _matrix = context.scene.ray_cast(
-        context.evaluated_depsgraph_get(),
-        view3d_utils.region_2d_to_origin_3d(region, region_3d, (mouse_x, mouse_y)),
-        view3d_utils.region_2d_to_vector_3d(region, region_3d, (mouse_x, mouse_y)),
-    )
-    if not hit or hit_obj != obj or location is None:
-        return False
-    mask_layer = _ensure_sculpt_mask_attribute(obj)
-    if mask_layer is None:
-        return False
-    world_to_object = obj.matrix_world.inverted_safe()
-    center = world_to_object @ location
-    radius = max(0.001, getattr(context.tool_settings.sculpt.brush, "size", 25.0) * 0.002)
-    radius_sq = radius * radius
-    changed = False
-    for vertex in obj.data.vertices:
-        distance_sq = (vertex.co - center).length_squared
-        if distance_sq > radius_sq and mask_layer.data[vertex.index].value < 1.0:
-            mask_layer.data[vertex.index].value = 1.0
-            changed = True
-    if changed:
-        obj.data.update()
-        tag_all_view3d_areas_for_redraw()
-    return changed
 
 
 def _unmasked_world_center(obj):
@@ -929,14 +658,6 @@ def _set_pivot_world_point(context, world_point, z_direction=None):
     _set_gizmo_matrix(obj.name, matrix)
 
 
-def _set_sculpt_tool(context, tool_id):
-    try:
-        bpy.ops.wm.tool_set_by_id(name=tool_id)
-        return True
-    except (RuntimeError, TypeError):
-        return False
-
-
 def _is_move_tool_active(context):
     try:
         from bl_ui.space_toolsystem_common import ToolSelectPanelHelper
@@ -965,21 +686,6 @@ class ZBNAV_MOVE_TOOL(bpy.types.WorkSpaceTool):
         layout.label(text="外圈：视图旋转 · 四角：视图平移")
         layout.label(text="中心方块：整体缩放")
         layout.label(text="Alt + 左键：重设轴心 / 只变换轴")
-
-
-class ZBNAV_OT_activate_sculpt_tool(bpy.types.Operator):
-    bl_idname = "zb_nav.activate_sculpt_tool"
-    bl_label = "切换雕刻工具"
-    bl_options = {"INTERNAL"}
-
-    tool_id: bpy.props.StringProperty()
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT"
-
-    def execute(self, context):
-        return {"FINISHED"} if _set_sculpt_tool(context, self.tool_id) else {"CANCELLED"}
 
 
 class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
@@ -1367,240 +1073,87 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
-class ZBNAV_OT_ctrl_diagnostic_monitor(bpy.types.Operator):
-    bl_idname = "zb_nav.ctrl_diagnostic_monitor"
-    bl_label = "Ctrl Mask Helper"
-    bl_options = {"INTERNAL"}
+class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
+    """轻量监听：只为移动工具的手柄提供悬停高亮。"""
 
-    _lasso_active = False
-    _lasso_points = []
-    _lasso_subtract = False
-    _lasso_moved = False
-    _native_mask_active = False
+    bl_idname = "zb_nav.gizmo_hover_monitor"
+    bl_label = "Gizmo Hover Monitor"
+    bl_options = {"INTERNAL"}
 
     @classmethod
     def poll(cls, context):
         return context.area and context.area.type == "VIEW_3D"
 
     def invoke(self, context, event):
-        global CTRL_DIAGNOSTIC_RUNNING, CTRL_LASSO_POINTS
-        if CTRL_DIAGNOSTIC_RUNNING:
-            _ctrl_log("duplicate Ctrl monitor invoke ignored")
+        global GIZMO_HOVER_MONITOR_RUNNING
+        if GIZMO_HOVER_MONITOR_RUNNING:
             return {"CANCELLED"}
-        CTRL_DIAGNOSTIC_RUNNING = True
-        _ctrl_log("Ctrl monitor started mode=%s object=%s", context.mode, getattr(context.active_object, "name", None))
-        self._lasso_active = False
-        self._lasso_points = []
-        self._lasso_subtract = False
-        self._lasso_moved = False
-        self._native_mask_active = False
-        CTRL_LASSO_POINTS = []
+        GIZMO_HOVER_MONITOR_RUNNING = True
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
-    def _push_mask_undo(self, message):
-        try:
-            bpy.ops.ed.undo_push(message=message)
-        except (RuntimeError, AttributeError):
-            pass
-
     def _finish(self, context):
-        global CTRL_DIAGNOSTIC_RUNNING, CTRL_LASSO_POINTS
-        _ctrl_log("Ctrl monitor finished lasso=%s native_mask=%s", self._lasso_active, self._native_mask_active)
-        self._lasso_active = False
-        self._native_mask_active = False
-        self._lasso_points = []
-        CTRL_DIAGNOSTIC_RUNNING = False
-        CTRL_LASSO_POINTS = []
+        global GIZMO_HOVER_MONITOR_RUNNING, MOVE_MODE_HOVER
+        GIZMO_HOVER_MONITOR_RUNNING = False
+        MOVE_MODE_HOVER = None
         if context.area:
             context.area.tag_redraw()
         return {"CANCELLED"}
 
-    def _handle_lasso_release(self, context, points):
-        global CTRL_HIT_STATUS
-        try:
-            if _is_lasso_click(points) and not self._lasso_moved:
-                self._push_mask_undo("ZB-Nav 反转遮罩")
-                bpy.ops.paint.mask_flood_fill(mode="INVERT", value=0.0)
-                CTRL_HIT_STATUS = "已反转全部遮罩"
-            elif not _lasso_covers_object(context, points):
-                self._push_mask_undo("ZB-Nav 清除遮罩")
-                bpy.ops.paint.mask_flood_fill(mode="VALUE", value=0.0)
-                CTRL_HIT_STATUS = "空白套索未遮罩到物体：已清除全部遮罩"
-            else:
-                self._push_mask_undo("ZB-Nav 套索遮罩")
-                bpy.ops.paint.mask_lasso_gesture(
-                    path=[
-                        {
-                            "name": str(index),
-                            "loc": (px, py),
-                            "time": float(index),
-                        }
-                        for index, (px, py) in enumerate(points)
-                    ],
-                    value=0.0 if self._lasso_subtract else 1.0,
-                )
-                CTRL_HIT_STATUS = "套索：已减选遮罩" if self._lasso_subtract else "套索：已添加遮罩"
-        except Exception as exc:
-            _ctrl_log_exception("lasso release failed points=%d subtract=%s", len(points), self._lasso_subtract)
-            CTRL_HIT_STATUS = f"遮罩操作失败: {exc}"
-        if context.area:
-            context.area.tag_redraw()
-
     def modal(self, context, event):
-        global CTRL_HIT_STATUS, CTRL_HIT_STATUS_X, CTRL_HIT_STATUS_Y
-        if event.type in {"LEFTMOUSE", "ESC"} or event.ctrl:
-            _ctrl_log("event type=%s value=%s ctrl=%s alt=%s shift=%s lasso=%s native=%s", event.type, event.value, event.ctrl, event.alt, event.shift, self._lasso_active, self._native_mask_active)
-        global CTRL_LASSO_POINTS
+        global MOVE_MODE_HOVER
         if not is_zbrush_sculpt_mode(context):
             return self._finish(context)
-        if _is_move_tool_active(context):
-            self._lasso_active = False
-            self._lasso_points = []
-            CTRL_LASSO_POINTS = []
-            if event.type == "MOUSEMOVE":
-                global MOVE_MODE_HOVER
+
+        if event.type == "MOUSEMOVE":
+            hover = None
+            if _is_move_tool_active(context):
                 hover = _move_mode_pick(
                     context, event.mouse_region_x, event.mouse_region_y
                 )
-                if hover != MOVE_MODE_HOVER:
-                    MOVE_MODE_HOVER = hover
-                    if context.area:
-                        context.area.tag_redraw()
-            return {"PASS_THROUGH"}
-
-        # A native mask stroke started on the model surface; let it run.
-        if self._native_mask_active:
-            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-                self._native_mask_active = False
-                _ctrl_log("native mask stroke released")
-            elif event.type == "ESC" and event.value == "PRESS":
-                self._native_mask_active = False
-                _ctrl_log("native mask stroke cancelled")
-            return {"PASS_THROUGH"}
-
-        if event.type == "ESC" and event.value == "PRESS":
-            self._lasso_active = False
-            self._lasso_points = []
-            CTRL_LASSO_POINTS = []
-            CTRL_HIT_STATUS = "套索已取消"
-            if context.area:
-                context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
-        if event.ctrl and event.type in {"MOUSEMOVE", "LEFTMOUSE"}:
-            CTRL_HIT_STATUS_X = event.mouse_region_x
-            CTRL_HIT_STATUS_Y = event.mouse_region_y
-            hit_object = find_object_under_mouse(
-                context, event.mouse_region_x, event.mouse_region_y
-            )
-            CTRL_HIT_STATUS = (
-                f"Ctrl 命中模型: {hit_object.name}"
-                if hit_object is not None
-                else "Ctrl 命中空白区域"
-            )
-            if context.area:
-                context.area.tag_redraw()
-
-        if self._lasso_active:
-            if event.type == "MOUSEMOVE":
-                point = (event.mouse_region_x, event.mouse_region_y)
-                if not self._lasso_points or point != self._lasso_points[-1]:
-                    self._lasso_points.append(point)
-                if len(self._lasso_points) >= LASSO_MIN_POINTS:
-                    self._lasso_moved = True
-                CTRL_LASSO_POINTS = list(self._lasso_points)
+            if hover != MOVE_MODE_HOVER:
+                MOVE_MODE_HOVER = hover
                 if context.area:
                     context.area.tag_redraw()
-                return {"RUNNING_MODAL"}
-            if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-                points = list(self._lasso_points)
-                self._lasso_active = False
-                self._lasso_points = []
-                CTRL_LASSO_POINTS = []
-                self._handle_lasso_release(context, points)
-                self._lasso_moved = False
-                _ctrl_log("lasso released points=%d", len(points))
-                return {"RUNNING_MODAL"}
 
-        if (
-            event.ctrl
-            and event.type == "LEFTMOUSE"
-            and event.value == "PRESS"
-        ):
-            hit_object = find_object_under_mouse(
-                context, event.mouse_region_x, event.mouse_region_y
-            )
-            if hit_object is None:
-                self._lasso_active = True
-                self._lasso_subtract = event.alt
-                self._lasso_moved = False
-                self._lasso_points = [(event.mouse_region_x, event.mouse_region_y)]
-                CTRL_LASSO_POINTS = list(self._lasso_points)
-                CTRL_HIT_STATUS = "空白命中：Alt 减选遮罩" if event.alt else "空白命中：添加遮罩"
-                if context.area:
-                    context.area.tag_redraw()
-                return {"RUNNING_MODAL"}
-            else:
-                # ZBrush-style Ctrl+Left on the model surface draws a mask via
-                # the native sculpt mask brush stroke.
-                self._native_mask_active = True
-                try:
-                    self._push_mask_undo("ZB-Nav 笔刷遮罩")
-                    bpy.ops.sculpt.brush_stroke(
-                        "INVOKE_DEFAULT",
-                        brush_toggle="MASK",
-                    )
-                except (RuntimeError, TypeError) as exc:
-                    self._native_mask_active = False
-                    CTRL_HIT_STATUS = f"遮罩笔触启动失败: {exc}"
-                    if context.area:
-                        context.area.tag_redraw()
-                    return {"RUNNING_MODAL"}
-                return {"RUNNING_MODAL"}
-
-        # Ctrl + 左键点击模型表面交给 Blender 原生遮罩笔刷。
         return {"PASS_THROUGH"}
 
 
-
 def add_zbrush_keymaps():
+    remove_zbrush_keymaps()
+    swap_sculpt_brush_modifiers()
     for item in ZBRUSH_KEYMAP_ITEMS:
         _add_keymap_item(item)
 
 
 def update_navigation_mode(context, mode):
-    global BRUSH_SIZE_OVERLAY_ACTIVE
-    if mode == "ZBRUSH":
-        if context.mode == "SCULPT" and not CTRL_DIAGNOSTIC_RUNNING:
-            try:
-                bpy.ops.zb_nav.ctrl_diagnostic_monitor("INVOKE_DEFAULT")
-            except (RuntimeError, TypeError):
-                pass
-    else:
-        BRUSH_SIZE_OVERLAY_ACTIVE = False
+    """切换子模式；开启时启动手柄悬停监测。"""
+    if (
+        mode == "ZBRUSH"
+        and context.mode == "SCULPT"
+        and not GIZMO_HOVER_MONITOR_RUNNING
+    ):
+        try:
+            bpy.ops.zb_nav.gizmo_hover_monitor("INVOKE_DEFAULT")
+        except (RuntimeError, TypeError):
+            pass
     set_nav_mode(context, mode)
     tag_all_view3d_areas_for_redraw()
     return True
 
 
-_AUTO_ZBRUSH_LAST_SCULPT = None
+_HOVER_MONITOR_LAST_SCULPT = None
 
 
-def _auto_zbrush_handler(scene, depsgraph):
-    """每次进入雕刻模式时自动开启 ZBrush 子模式。"""
-    global _AUTO_ZBRUSH_LAST_SCULPT
+def _hover_monitor_handler(scene, depsgraph):
+    """进入雕刻模式时补启动悬停监测（不会自动打开 ZBrush 开关）。"""
+    global _HOVER_MONITOR_LAST_SCULPT
     context = bpy.context
     is_sculpt = context.mode == "SCULPT"
-    if is_sculpt == _AUTO_ZBRUSH_LAST_SCULPT:
+    if is_sculpt == _HOVER_MONITOR_LAST_SCULPT:
         return
-    _AUTO_ZBRUSH_LAST_SCULPT = is_sculpt
-    if (
-        is_sculpt
-        and context.active_object
-        and context.active_object.type == "MESH"
-        and get_nav_mode(context) != "ZBRUSH"
-    ):
+    _HOVER_MONITOR_LAST_SCULPT = is_sculpt
+    if is_sculpt and is_navigation_enabled(context):
         try:
             update_navigation_mode(context, "ZBRUSH")
         except Exception:
@@ -1632,32 +1185,21 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         step=10,
     )
 
-    brush_size_sensitivity: FloatProperty(
-        name="Brush Size Sensitivity",
-        description="空格拖拽调整笔刷大小时的灵敏度倍数（越大拖得越快）",
-        default=2.0,
-        min=0.1,
-        max=10.0,
-        soft_min=0.5,
-        soft_max=5.0,
-        step=10,
-    )
-
     axis_color_x: FloatVectorProperty(
         name="X 轴颜色",
-        description="控制轴 X 轴颜色（保留设置，仅用于兼容已有颜色）",
+        description="控制轴 X 轴颜色",
         default=(0.42, 0.055, 0.055),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
     axis_color_y: FloatVectorProperty(
         name="Y 轴颜色",
-        description="控制轴 Y 轴颜色（保留设置，仅用于兼容已有颜色）",
+        description="控制轴 Y 轴颜色",
         default=(0.055, 0.42, 0.08),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
     axis_color_z: FloatVectorProperty(
         name="Z 轴颜色",
-        description="控制轴 Z 轴颜色（保留设置，仅用于兼容已有颜色）",
+        description="控制轴 Z 轴颜色",
         default=(0.07, 0.18, 0.48),
         min=0.0, max=1.0, size=3, subtype="COLOR",
     )
@@ -1666,7 +1208,11 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
         layout = self.layout
         layout.prop(self, "pan_sensitivity")
         layout.prop(self, "zoom_sensitivity")
-        layout.prop(self, "brush_size_sensitivity")
+        layout.label(text="控制轴颜色")
+        color_row = layout.row(align=True)
+        color_row.prop(self, "axis_color_x", text="")
+        color_row.prop(self, "axis_color_y", text="")
+        color_row.prop(self, "axis_color_z", text="")
 
 
 class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
@@ -1805,299 +1351,6 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
         self._last_depth_location = focus_location
 
 
-class ZBNAV_OT_switch_sculpt_target(bpy.types.Operator):
-    bl_idname = "zb_nav.switch_sculpt_target"
-    bl_label = "切换到目标雕刻"
-    bl_description = "无需手动退出雕刻模式，直接切换到选择框中的网格对象"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        target = getattr(context.window_manager, "zb_nav_sculpt_target", None)
-        return is_zbrush_sculpt_mode(context) and is_valid_sculpt_target(context, target)
-
-    def execute(self, context):
-        target = context.window_manager.zb_nav_sculpt_target
-        success, message = switch_sculpt_target(context, target)
-        if not success:
-            self.report({"WARNING"}, message)
-            return {"CANCELLED"}
-        self.report({"INFO"}, message)
-        return {"FINISHED"}
-
-
-def get_zb_nav_subdivision(obj):
-    if obj is None or obj.type != "MESH":
-        return None
-    modifier = obj.modifiers.get("ZB-Nav 动态细分")
-    return modifier if modifier is not None and modifier.type == "SUBSURF" else None
-
-
-def set_sculpt_object_isolated(context, isolate):
-    obj = context.active_object
-    if obj is None or obj.type != "MESH":
-        return False
-
-    if isolate:
-        hidden_state = {}
-        for other in context.view_layer.objects:
-            if other == obj or other.type in {"CAMERA", "LIGHT"}:
-                continue
-            hidden_state[other.name] = bool(other.hide_get())
-            other.hide_set(True)
-        context.window_manager["zb_nav_isolate_state"] = hidden_state
-    else:
-        hidden_state = context.window_manager.get("zb_nav_isolate_state", {})
-        for name, was_hidden in hidden_state.items():
-            other = bpy.data.objects.get(name)
-            if other is not None and other.name in context.view_layer.objects:
-                other.hide_set(bool(was_hidden))
-        context.window_manager.pop("zb_nav_isolate_state", None)
-    tag_all_view3d_areas_for_redraw()
-    return True
-
-
-class ZBNAV_OT_toggle_isolate(bpy.types.Operator):
-    bl_idname = "zb_nav.toggle_isolate"
-    bl_label = "切换单独显示"
-    bl_options = {"INTERNAL"}
-
-    isolate: bpy.props.BoolProperty(default=True)
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT" and context.active_object is not None
-
-    def execute(self, context):
-        return {"FINISHED"} if set_sculpt_object_isolated(context, self.isolate) else {"CANCELLED"}
-
-
-class ZBNAV_OT_toggle_wireframe(bpy.types.Operator):
-    bl_idname = "zb_nav.toggle_wireframe"
-    bl_label = "切换物体网格"
-    bl_options = {"INTERNAL"}
-
-    enabled: bpy.props.BoolProperty(default=True)
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT" and context.active_object is not None
-
-    def execute(self, context):
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            return {"CANCELLED"}
-        obj.show_wire = self.enabled
-        obj.show_all_edges = self.enabled
-        tag_all_view3d_areas_for_redraw()
-        return {"FINISHED"}
-
-
-class ZBNAV_OT_toggle_subdivision(bpy.types.Operator):
-    bl_idname = "zb_nav.toggle_subdivision"
-    bl_label = "切换动态细分"
-    bl_options = {"REGISTER", "UNDO"}
-
-    enabled: bpy.props.BoolProperty(default=True)
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT" and context.active_object is not None
-
-    def execute(self, context):
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            return {"CANCELLED"}
-        modifier = get_zb_nav_subdivision(obj)
-        if self.enabled:
-            if modifier is None:
-                modifier = obj.modifiers.new("ZB-Nav 动态细分", "SUBSURF")
-                modifier.subdivision_type = "CATMULL_CLARK"
-                modifier.levels = 2
-                modifier.render_levels = 2
-            modifier.show_viewport = True
-        elif modifier is not None:
-            modifier.show_viewport = False
-        tag_all_view3d_areas_for_redraw()
-        return {"FINISHED"}
-
-
-class ZBNAV_OT_activate_tool(bpy.types.Operator):
-    bl_idname = "zb_nav.activate_tool"
-    bl_label = "激活工具"
-    bl_options = {"INTERNAL"}
-
-    tool_name: bpy.props.StringProperty()
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT" and context.area and context.area.type == "VIEW_3D"
-
-    def execute(self, context):
-        if not _set_sculpt_tool(context, self.tool_name):
-            self.report({"WARNING"}, f"无法激活工具：{self.tool_name}")
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class ZBNAV_OT_loop_auto_mask_algorithm(bpy.types.Operator):
-    bl_idname = "zb_nav.loop_auto_mask_algorithm"
-    bl_label = "选择循环线算法"
-    bl_options = {"INTERNAL"}
-
-    algorithm: bpy.props.EnumProperty(
-        items=(
-            ("VERTEX_RING", "顶点环线", "从鼠标中心最近顶点的相邻方向追踪"),
-            ("EDGE_LOOP", "边循环线", "从鼠标中心最近边追踪 Edge Loop"),
-            ("FACE_BOUNDARY", "面边界", "显示命中面边界，仅用于对比识别结果"),
-        ),
-        default="VERTEX_RING",
-    )
-
-    def execute(self, context):
-        global LOOP_AUTO_MASK_ALGORITHM
-        LOOP_AUTO_MASK_ALGORITHM = self.algorithm
-        if context.area:
-            context.area.tag_redraw()
-        return {"FINISHED"}
-
-
-class ZBNAV_OT_loop_auto_mask(bpy.types.Operator):
-    bl_idname = "zb_nav.loop_auto_mask"
-    bl_label = "环线自动遮罩"
-    bl_options = {"INTERNAL"}
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "SCULPT"
-
-    def execute(self, context):
-        global LOOP_AUTO_MASK_ACTIVE
-        LOOP_AUTO_MASK_ACTIVE = not LOOP_AUTO_MASK_ACTIVE
-        context.window_manager["zb_nav_loop_auto_mask"] = LOOP_AUTO_MASK_ACTIVE
-        return {"FINISHED"}
-
-
-class ZBNAV_BrushSizeMixin:
-    _last_mouse_x = 0
-    _start_mouse_x = 0
-    _start_mouse_y = 0
-    _left_mouse_down = False
-    _moved = False
-    _adjusted = False
-    _size_accumulator = 0.0
-
-    def _apply_brush_size(self, context, event):
-        brush_owner, size_property = get_brush_size_owner(context)
-        if brush_owner is None:
-            return True
-
-        raw_delta = event.mouse_x - self._last_mouse_x
-        self._last_mouse_x = event.mouse_x
-
-        prefs = get_preferences(context)
-        sensitivity = prefs.brush_size_sensitivity if prefs else 2.0
-        self._size_accumulator += raw_delta * sensitivity
-        step = int(self._size_accumulator)
-        if step == 0:
-            return True
-        self._size_accumulator -= step
-
-        current_size = int(getattr(brush_owner, size_property))
-        new_size = max(1, min(current_size + step, MAX_BRUSH_SIZE))
-        try:
-            setattr(brush_owner, size_property, new_size)
-        except (TypeError, ValueError):
-            return False
-        if context.area:
-            context.area.tag_redraw()
-        return True
-
-
-class ZBNAV_OT_space_brush_size(ZBNAV_BrushSizeMixin, bpy.types.Operator):
-    bl_idname = "zb_nav.space_brush_size"
-    bl_label = "Adjust Sculpt Brush Size"
-    bl_description = "点按空格进入，然后按住左键水平拖动调整雕刻笔刷大小（类似 F）"
-    bl_options = {"INTERNAL", "BLOCKING"}
-
-    @classmethod
-    def poll(cls, context):
-        return is_zbrush_sculpt_mode(context)
-
-    def invoke(self, context, event):
-        global BRUSH_SIZE_OVERLAY_ACTIVE
-        self._last_mouse_x = event.mouse_x
-        self._start_mouse_x = event.mouse_x
-        self._start_mouse_y = event.mouse_y
-        self._left_mouse_down = False
-        self._moved = False
-        self._adjusted = False
-        self._size_accumulator = 0.0
-        self._space_released = False
-        BRUSH_SIZE_OVERLAY_ACTIVE = True
-        if context.area:
-            context.area.tag_redraw()
-        context.window_manager.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def _finish(self, context, cancel=False):
-        global BRUSH_SIZE_OVERLAY_ACTIVE
-        BRUSH_SIZE_OVERLAY_ACTIVE = False
-        if context.area:
-            context.area.tag_redraw()
-        return {"CANCELLED"} if cancel else {"FINISHED"}
-
-    def modal(self, context, event):
-        if not is_zbrush_sculpt_mode(context):
-            return self._finish(context, cancel=True)
-
-        if event.type == "ESC" and event.value == "PRESS":
-            return self._finish(context)
-
-        if event.type == "SPACE":
-            if event.value == "RELEASE":
-                if self._adjusted:
-                    return self._finish(context)
-                self._space_released = True
-            elif event.value == "PRESS" and self._space_released and not self._left_mouse_down:
-                return self._finish(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "LEFTMOUSE":
-            if event.value == "PRESS":
-                self._left_mouse_down = True
-                self._start_mouse_x = event.mouse_x
-                self._start_mouse_y = event.mouse_y
-                self._moved = False
-                self._last_mouse_x = event.mouse_x
-                self._size_accumulator = 0.0
-                return {"RUNNING_MODAL"}
-            if event.value == "RELEASE":
-                was_down = self._left_mouse_down
-                self._left_mouse_down = False
-                if was_down and not self._moved and self._adjusted:
-                    return self._finish(context)
-                self._last_mouse_x = event.mouse_x
-                return {"RUNNING_MODAL"}
-
-        if event.type == "MOUSEMOVE":
-            if self._left_mouse_down:
-                if (
-                    abs(event.mouse_x - self._start_mouse_x)
-                    + abs(event.mouse_y - self._start_mouse_y)
-                ) > 3:
-                    self._moved = True
-                if self._moved:
-                    if not self._apply_brush_size(context, event):
-                        self.report({"WARNING"}, "当前笔刷大小属性不支持调整")
-                        return self._finish(context, cancel=True)
-                    self._adjusted = True
-                self._last_mouse_x = event.mouse_x
-            return {"RUNNING_MODAL"}
-
-        return {"RUNNING_MODAL"}
-
-
 class ZBNAV_OT_alt_select_target(bpy.types.Operator):
     bl_idname = "zb_nav.alt_select_target"
     bl_label = "Switch Sculpt Target"
@@ -2114,73 +1367,6 @@ class ZBNAV_OT_alt_select_target(bpy.types.Operator):
         return {"PASS_THROUGH"}
 
 
-class ZBNAV_OT_alt_select_or_invert(bpy.types.Operator):
-    bl_idname = "zb_nav.alt_select_or_invert"
-    bl_label = "ZBrush Sculpt Target Switch"
-    bl_description = "ZBrush 模式下 Alt + 鼠标中键点击切换模型，拖动平移视图"
-    bl_options = {"REGISTER", "BLOCKING", "GRAB_CURSOR"}
-
-    _start_mouse_x = 0
-    _start_mouse_y = 0
-    _last_mouse_x = 0
-    _last_mouse_y = 0
-    _moved = False
-
-    @classmethod
-    def poll(cls, context):
-        return is_zbrush_sculpt_mode(context)
-
-    def invoke(self, context, event):
-        if not (event.ctrl and event.shift and event.type == "MIDDLEMOUSE"):
-            return {"PASS_THROUGH"}
-        self._start_mouse_x = event.mouse_region_x
-        self._start_mouse_y = event.mouse_region_y
-        self._last_mouse_x = event.mouse_region_x
-        self._last_mouse_y = event.mouse_region_y
-        self._moved = False
-        context.window_manager.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        if event.type == "MOUSEMOVE":
-            current_x = event.mouse_region_x
-            current_y = event.mouse_region_y
-            if abs(current_x - self._start_mouse_x) > 3 or abs(current_y - self._start_mouse_y) > 3:
-                self._moved = True
-            if self._moved:
-                self._pan_view(context, current_x, current_y)
-            self._last_mouse_x = current_x
-            self._last_mouse_y = current_y
-            context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
-        if event.type in {"MIDDLEMOUSE", "ESC"} and event.value == "RELEASE":
-            if not self._moved and event.type == "MIDDLEMOUSE":
-                select_or_invert_sculpt_target(context, event)
-            return {"FINISHED"}
-
-        return {"RUNNING_MODAL"}
-
-    def _pan_view(self, context, current_x, current_y):
-        region = context.region
-        region_3d = context.region_data
-        previous = location_on_depth(
-            region,
-            region_3d,
-            self._last_mouse_x,
-            self._last_mouse_y,
-            region_3d.view_location,
-        )
-        current = location_on_depth(
-            region,
-            region_3d,
-            current_x,
-            current_y,
-            region_3d.view_location,
-        )
-        region_3d.view_location += previous - current
-
-
 class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
     bl_idname = "zb_nav.set_navigation_mode"
     bl_label = "Toggle ZBrush Sculpt Mode"
@@ -2193,135 +1379,8 @@ class ZBNAV_OT_set_navigation_mode(bpy.types.Operator):
 
     def execute(self, context):
         next_mode = "BLENDER" if is_navigation_enabled(context) else "ZBRUSH"
-        set_nav_mode(context, next_mode)
-        tag_all_view3d_areas_for_redraw()
+        update_navigation_mode(context, next_mode)
         return {"FINISHED"}
-
-
-def _single_vertex_loop(mesh, start_vertex_index):
-    edge_lookup = {tuple(sorted(edge.vertices)): edge.index for edge in mesh.edges}
-    edge_faces = {edge.index: [] for edge in mesh.edges}
-    face_edges = {}
-    for polygon in mesh.polygons:
-        if len(polygon.vertices) != 4:
-            continue
-        edge_indices = []
-        for edge_key in polygon.edge_keys:
-            edge_index = edge_lookup.get(tuple(sorted(edge_key)))
-            if edge_index is not None:
-                edge_indices.append(edge_index)
-                edge_faces[edge_index].append(polygon.index)
-        if len(edge_indices) == 4:
-            face_edges[polygon.index] = edge_indices
-
-    incident_edges = [
-        edge.index for edge in mesh.edges if start_vertex_index in edge.vertices
-    ]
-    if not incident_edges:
-        return []
-
-    def edge_faces_for(edge_index):
-        return [index for index in edge_faces[edge_index] if index in face_edges]
-
-    def opposite_edge(face_index, edge_index):
-        current = set(mesh.edges[edge_index].vertices)
-        candidates = [
-            candidate for candidate in face_edges[face_index]
-            if current.isdisjoint(mesh.edges[candidate].vertices)
-        ]
-        return candidates[0] if len(candidates) == 1 else None
-
-    def trace(start_edge, start_face):
-        result = []
-        current_edge = start_edge
-        current_face = start_face
-        while current_edge not in result:
-            result.append(current_edge)
-            next_edge = opposite_edge(current_face, current_edge)
-            if next_edge is None:
-                break
-            candidates = [
-                face_index for face_index in edge_faces_for(next_edge)
-                if face_index != current_face
-            ]
-            if not candidates:
-                break
-            current_edge = next_edge
-            current_face = candidates[0]
-        return result
-
-    candidates = []
-    for edge_index in incident_edges:
-        for face_index in edge_faces_for(edge_index):
-            path = trace(edge_index, face_index)
-            if path:
-                candidates.append(path)
-
-    if not candidates:
-        return []
-    def unique_edge_set(path):
-        return frozenset(path)
-
-    unique_candidates = {}
-    for path in candidates:
-        key = unique_edge_set(path)
-        if len(path) > len(unique_candidates.get(key, ())):
-            unique_candidates[key] = path
-    chosen = max(unique_candidates.values(), key=len)
-    return list(dict.fromkeys(chosen))
-
-
-def _loop_mask_preview_points(context, mouse_x, mouse_y):
-    obj = context.active_object
-    region = context.region
-    region_3d = context.region_data
-    if not obj or obj.type != "MESH" or not region or not region_3d:
-        return []
-    ray_origin = view3d_utils.region_2d_to_origin_3d(
-        region, region_3d, (mouse_x, mouse_y)
-    )
-    ray_direction = view3d_utils.region_2d_to_vector_3d(
-        region, region_3d, (mouse_x, mouse_y)
-    )
-    hit, location, _normal, face_index, hit_obj, _matrix = context.scene.ray_cast(
-        context.evaluated_depsgraph_get(), ray_origin, ray_direction
-    )
-    if not hit or getattr(hit_obj, "original", hit_obj) != obj:
-        return []
-
-    mesh = obj.data
-    local_hit = obj.matrix_world.inverted_safe() @ location
-    nearest_vertex = min(
-        mesh.vertices,
-        key=lambda vertex: (vertex.co - local_hit).length_squared,
-    )
-    loop_edges = _single_vertex_loop(mesh, nearest_vertex.index)
-    if not loop_edges:
-        return []
-
-    first_edge = mesh.edges[loop_edges[0]]
-    loop_vertices = [first_edge.vertices[0], first_edge.vertices[1]]
-    for edge_index in loop_edges[1:]:
-        edge_vertices = set(mesh.edges[edge_index].vertices)
-        previous = loop_vertices[-1]
-        next_vertices = edge_vertices - {previous}
-        if not next_vertices:
-            break
-        loop_vertices.append(next_vertices.pop())
-
-    points = []
-    for vertex_index in loop_vertices:
-        screen = _to_screen(context, obj.matrix_world @ mesh.vertices[vertex_index].co)
-        if screen:
-            points.append((screen.x, screen.y))
-    return points
-
-
-def draw_zbrush_mode_border():
-    context = bpy.context
-    draw_move_mode_gizmo()
-    if is_zbrush_sculpt_mode(context):
-        draw_ctrl_hit_status()
 
 
 def _draw_line_2d(shader, a, b, color):
@@ -2373,29 +1432,6 @@ def _draw_filled_circle_2d(shader, center, radius, color, segments=20):
     batch.draw(shader)
 
 
-def _draw_rounded_rect_2d(shader, x1, y1, x2, y2, radius, color, segments=5):
-    radius = max(0.0, min(radius, abs(x2 - x1) * 0.5, abs(y2 - y1) * 0.5))
-    centers = (
-        (x2 - radius, y2 - radius, 0.0),
-        (x1 + radius, y2 - radius, math.pi * 0.5),
-        (x1 + radius, y1 + radius, math.pi),
-        (x2 - radius, y1 + radius, math.pi * 1.5),
-    )
-    outline = []
-    for cx, cy, start in centers:
-        for step in range(segments + 1):
-            angle = start + (math.pi * 0.5) * step / segments
-            outline.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
-    verts = []
-    center = ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
-    for index, point in enumerate(outline):
-        verts.extend((center, point, outline[(index + 1) % len(outline)]))
-    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
-
-
 def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=32):
     points = []
     for step in range(segments + 1):
@@ -2406,6 +1442,7 @@ def _draw_circle_outline_2d(shader, center, radius, color, width=1.0, segments=3
 
 
 def _gizmo_button_positions(_context, origin_screen):
+    # GIZMO_BUTTON_Y_OFFSET 是轴在屏幕上的像素长度的倍数。
     pixel_offset = GIZMO_PIXEL_SIZE * GIZMO_BUTTON_Y_OFFSET
     spacing = GIZMO_BUTTON_SPACING
     base_y = origin_screen.y + pixel_offset
@@ -2751,96 +1788,11 @@ def draw_move_mode_gizmo():
     gpu.state.blend_set("NONE")
 
 
-def draw_loop_mask_preview():
-    return
-
-
-def _draw_filled_circle_2d_points(shader, points, radius, color):
-    for x, y in points:
-        _draw_filled_circle_2d(shader, (x, y), radius, color, segments=10)
-
-
-def draw_ctrl_hit_status():
-    if not is_zbrush_sculpt_mode(bpy.context):
-        return
-    context = bpy.context
-    region = context.region
-    if not region or region.type != "WINDOW":
-        return
-
-    if CTRL_LASSO_POINTS:
-        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        points = [(float(px), float(py)) for px, py in CTRL_LASSO_POINTS]
-        if len(points) >= 3:
-            fill_verts = []
-            for index in range(1, len(points) - 1):
-                fill_verts.extend((points[0], points[index], points[index + 1]))
-            fill_batch = batch_for_shader(shader, "TRIS", {"pos": fill_verts})
-            gpu.state.blend_set("ALPHA")
-            shader.bind()
-            shader.uniform_float("color", (0.0, 0.0, 0.0, 0.16))
-            fill_batch.draw(shader)
-        if len(points) >= 2:
-            vertices = points + [points[0]]
-            batch = batch_for_shader(shader, "LINE_STRIP", {"pos": vertices})
-            gpu.state.blend_set("ALPHA")
-            gpu.state.line_width_set(1.5)
-            shader.bind()
-            shader.uniform_float("color", (1.0, 1.0, 1.0, 0.95))
-            batch.draw(shader)
-            gpu.state.line_width_set(1.0)
-            gpu.state.blend_set("NONE")
-
-    x = min(max(float(CTRL_HIT_STATUS_X) + 18.0, 8.0), max(region.width - 260.0, 8.0))
-    y = min(max(float(CTRL_HIT_STATUS_Y) + 18.0, 24.0), max(region.height - 24.0, 24.0))
-    font_id = 0
-    blf.size(font_id, 15)
-    blf.color(font_id, 0.2, 1.0, 0.35, 1.0)
-    blf.position(font_id, 24, region.height - 70, 0)
-    blf.draw(font_id, "ZB-Nav Ctrl 遮罩辅助已启动")
-    blf.color(font_id, 1.0, 0.8, 0.1, 1.0)
-    blf.position(font_id, x, y, 0)
-    blf.draw(font_id, CTRL_HIT_STATUS)
-
-
-def draw_brush_size_overlay():
-    if not BRUSH_SIZE_OVERLAY_ACTIVE:
-        return
-    context = bpy.context
-    if not is_zbrush_sculpt_mode(context):
-        return
-
-    region = context.region
-    if not region or region.type != "WINDOW":
-        return
-
-    brush_owner, size_property = get_brush_size_owner(context)
-    if brush_owner is None:
-        return
-
-    value = getattr(brush_owner, size_property)
-    font_id = 0
-    blf.size(font_id, 16)
-    blf.color(font_id, 0.0, 0.95, 0.6, 1.0)
-    blf.position(font_id, 24, region.height - 28, 0)
-    blf.draw(font_id, f"Brush Size: {value}")
-    blf.position(font_id, 24, region.height - 46, 0)
-    blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
-    blf.draw(font_id, "拖动调整 · 点击 / 空格 / Esc 退出")
-
-
 def register_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER, CTRL_HIT_STATUS_HANDLER
+    global VIEW3D_DRAW_HANDLER
     if VIEW3D_DRAW_HANDLER is None:
         VIEW3D_DRAW_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
-            draw_zbrush_mode_border,
-            (),
-            "WINDOW",
-            "POST_PIXEL",
-        )
-    if BRUSH_SIZE_OVERLAY_HANDLER is None:
-        BRUSH_SIZE_OVERLAY_HANDLER = bpy.types.SpaceView3D.draw_handler_add(
-            draw_brush_size_overlay,
+            draw_move_mode_gizmo,
             (),
             "WINDOW",
             "POST_PIXEL",
@@ -2849,27 +1801,13 @@ def register_view3d_draw_handler():
 
 
 def unregister_view3d_draw_handler():
-    global VIEW3D_DRAW_HANDLER, BRUSH_SIZE_OVERLAY_HANDLER, CTRL_HIT_STATUS_HANDLER
+    global VIEW3D_DRAW_HANDLER
     if VIEW3D_DRAW_HANDLER is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(VIEW3D_DRAW_HANDLER, "WINDOW")
         except (ReferenceError, RuntimeError, ValueError):
             pass
         VIEW3D_DRAW_HANDLER = None
-    if BRUSH_SIZE_OVERLAY_HANDLER is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(BRUSH_SIZE_OVERLAY_HANDLER, "WINDOW")
-        except (ReferenceError, RuntimeError, ValueError):
-            pass
-        BRUSH_SIZE_OVERLAY_HANDLER = None
-    if CTRL_HIT_STATUS_HANDLER is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(
-                CTRL_HIT_STATUS_HANDLER, "WINDOW"
-            )
-        except (ReferenceError, RuntimeError, ValueError):
-            pass
-        CTRL_HIT_STATUS_HANDLER = None
 
 
 def draw_view3d_header_buttons(self, context):
@@ -2903,48 +1841,33 @@ def unregister_view3d_header_buttons():
 
 CLASSES = (
     ZBNAV_AddonPreferences,
-    ZBNAV_OT_switch_sculpt_target,
-    ZBNAV_OT_toggle_isolate,
-    ZBNAV_OT_toggle_wireframe,
-    ZBNAV_OT_toggle_subdivision,
-    ZBNAV_OT_activate_tool,
     ZBNAV_OT_pan_or_zoom,
-    ZBNAV_OT_space_brush_size,
     ZBNAV_OT_alt_select_target,
-    ZBNAV_OT_alt_select_or_invert,
-    ZBNAV_OT_ctrl_diagnostic_monitor,
-    ZBNAV_OT_move_mode_drag,
     ZBNAV_OT_set_navigation_mode,
+    ZBNAV_OT_gizmo_hover_monitor,
+    ZBNAV_OT_move_mode_drag,
 )
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.WindowManager.zb_nav_sculpt_target = PointerProperty(
-        name="雕刻目标",
-        description="选择要直接切换到雕刻模式的网格对象",
-        type=bpy.types.Object,
-        poll=sculpt_target_poll,
-    )
     bpy.utils.register_tool(ZBNAV_MOVE_TOOL, separator=True)
     register_view3d_header_buttons()
     register_view3d_draw_handler()
     add_zbrush_keymaps()
-    if not bpy.app.handlers.depsgraph_update_post.count(_auto_zbrush_handler):
-        bpy.app.handlers.depsgraph_update_post.append(_auto_zbrush_handler)
+    if not bpy.app.handlers.depsgraph_update_post.count(_hover_monitor_handler):
+        bpy.app.handlers.depsgraph_update_post.append(_hover_monitor_handler)
     tag_all_view3d_areas_for_redraw()
 
 
 def unregister():
-    global CTRL_DIAGNOSTIC_RUNNING
-    CTRL_DIAGNOSTIC_RUNNING = False
-    if bpy.app.handlers.depsgraph_update_post.count(_auto_zbrush_handler):
-        bpy.app.handlers.depsgraph_update_post.remove(_auto_zbrush_handler)
+    global GIZMO_HOVER_MONITOR_RUNNING
+    GIZMO_HOVER_MONITOR_RUNNING = False
+    if bpy.app.handlers.depsgraph_update_post.count(_hover_monitor_handler):
+        bpy.app.handlers.depsgraph_update_post.remove(_hover_monitor_handler)
     remove_zbrush_keymaps()
     restore_sculpt_brush_modifiers()
-    restore_view_rotate_axis_snap()
-    restore_plain_space_keymaps()
     unregister_view3d_draw_handler()
     if hasattr(bpy.context, "window_manager"):
         bpy.context.window_manager.pop(NAV_MODE_PROP, None)
@@ -2954,7 +1877,5 @@ def unregister():
         bpy.utils.unregister_tool(ZBNAV_MOVE_TOOL)
     except Exception:
         pass
-    if hasattr(bpy.types.WindowManager, "zb_nav_sculpt_target"):
-        del bpy.types.WindowManager.zb_nav_sculpt_target
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
