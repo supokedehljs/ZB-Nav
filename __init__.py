@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 16, 0),
+    "version": (1, 17, 0),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
