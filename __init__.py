@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 17, 0),
+    "version": (1, 17, 1),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -789,9 +789,11 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     bl_idname = "zb_nav.move_mode_drag"
     bl_label = "Move Mode Drag"
     bl_description = "拖动变换轴控制物体移动/缩放/旋转"
-    # No "UNDO" here: the operator pushes its own undo step at drag start so
-    # one drag stays one undo step.
-    bl_options = {"REGISTER"}
+    # "UNDO" is required: the vertex edits this operator makes are otherwise
+    # invisible to Blender's undo system in sculpt mode, so Ctrl+Z did nothing.
+    # The operator additionally pushes a step at drag start (see invoke) so the
+    # first undo returns to the pre-drag state.
+    bl_options = {"REGISTER", "UNDO"}
 
     _drag_handle = None
     _last_x = 0
@@ -806,7 +808,8 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return (
-            context.mode == "SCULPT"
+            is_navigation_enabled(context)
+            and context.mode == "SCULPT"
             and context.active_object is not None
             and context.area
             and context.area.type == "VIEW_3D"
@@ -1226,7 +1229,8 @@ def add_zbrush_keymaps():
 
 
 def update_navigation_mode(context, mode):
-    """切换子模式；开启时启动手柄悬停监测。"""
+    """切换子模式；开启时启动手柄悬停监测，关闭时清掉悬停状态。"""
+    global MOVE_MODE_HOVER
     if (
         mode == "ZBRUSH"
         and context.mode == "SCULPT"
@@ -1236,6 +1240,8 @@ def update_navigation_mode(context, mode):
             bpy.ops.zb_nav.gizmo_hover_monitor("INVOKE_DEFAULT")
         except (RuntimeError, TypeError):
             pass
+    else:
+        MOVE_MODE_HOVER = None
     set_nav_mode(context, mode)
     tag_all_view3d_areas_for_redraw()
     return True
@@ -1962,6 +1968,9 @@ def _draw_tube_band_2d(shader, context, origin, e1, e2, radius, tube_w, tube_h, 
 
 def draw_move_mode_gizmo():
     context = bpy.context
+    # The header toggle is the master switch: nothing is drawn while it is off.
+    if not is_navigation_enabled(context):
+        return
     if context.mode != "SCULPT":
         return
     if not _is_move_tool_active(context):
