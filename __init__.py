@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 37, 2),
+    "version": (1, 37, 8),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -40,6 +40,11 @@ ALT_DRAG_THRESHOLD = 6.0
 _MODE_SHORTCUT_YIELDED_ITEMS = []
 _REPORTED_DRAW_ERRORS = set()
 _CAPSLOCK_LAST_STATE = None
+ORBIT_PIVOT_MARKER = None
+ORBIT_PIVOT_MARKER_VISIBLE = False
+BLENDER_TRACKBALL_RADIUS = 1.1
+NATIVE_ORBIT_INPUT_STATE = None
+NATIVE_ORBIT_WATCH_ACTIVE = False
 FLOATING_PANEL_STATES = {}
 ISOLATION_STATES = {}
 
@@ -750,6 +755,96 @@ def tag_all_view3d_areas_for_redraw():
         for area in screen.areas:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
+
+
+def _set_orbit_pivot_marker(context, location):
+    """Expose the exact world-space pivot used by the current orbit."""
+    global ORBIT_PIVOT_MARKER, ORBIT_PIVOT_MARKER_VISIBLE
+    area = getattr(context, "area", None)
+    if (
+        location is None
+        or area is None
+        or getattr(area, "type", None) != "VIEW_3D"
+    ):
+        return
+    ORBIT_PIVOT_MARKER = {
+        "location": location.copy(),
+        "area_pointer": area.as_pointer(),
+    }
+    ORBIT_PIVOT_MARKER_VISIBLE = False
+    area.tag_redraw()
+
+
+def _show_orbit_pivot_marker():
+    global ORBIT_PIVOT_MARKER_VISIBLE
+    if ORBIT_PIVOT_MARKER is not None and not ORBIT_PIVOT_MARKER_VISIBLE:
+        ORBIT_PIVOT_MARKER_VISIBLE = True
+        tag_all_view3d_areas_for_redraw()
+
+
+def _clear_orbit_pivot_marker(context=None):
+    global ORBIT_PIVOT_MARKER, ORBIT_PIVOT_MARKER_VISIBLE
+    ORBIT_PIVOT_MARKER = None
+    ORBIT_PIVOT_MARKER_VISIBLE = False
+    area = getattr(context, "area", None) if context is not None else None
+    if area is not None:
+        area.tag_redraw()
+
+
+def _middle_mouse_is_down():
+    """Return the physical middle-button state on Windows."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetKeyState(0x04) & 0x8000)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _native_orbit_watch_timer():
+    """Show the marker only while the physical middle button is held."""
+    global NATIVE_ORBIT_WATCH_ACTIVE
+    if not NATIVE_ORBIT_WATCH_ACTIVE:
+        return None
+    pressed = _middle_mouse_is_down()
+    if pressed is None:
+        NATIVE_ORBIT_WATCH_ACTIVE = False
+        _clear_orbit_pivot_marker(bpy.context)
+        return None
+    if pressed:
+        _show_orbit_pivot_marker()
+        return 0.03
+    NATIVE_ORBIT_WATCH_ACTIVE = False
+    _clear_orbit_pivot_marker(bpy.context)
+    return None
+
+
+def _restore_native_orbit_inputs():
+    """Restore the two native pivot settings after view3d.rotate initializes."""
+    global NATIVE_ORBIT_INPUT_STATE
+    state = NATIVE_ORBIT_INPUT_STATE
+    NATIVE_ORBIT_INPUT_STATE = None
+    if state is None:
+        return None
+    try:
+        inputs = bpy.context.preferences.inputs
+        inputs.use_mouse_depth_navigate = state[0]
+        inputs.use_rotate_around_active = state[1]
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _clear_native_orbit_watch():
+    global NATIVE_ORBIT_WATCH_ACTIVE
+    NATIVE_ORBIT_WATCH_ACTIVE = False
+    try:
+        if bpy.app.timers.is_registered(_native_orbit_watch_timer):
+            bpy.app.timers.unregister(_native_orbit_watch_timer)
+    except (AttributeError, ValueError):
+        pass
+    _restore_native_orbit_inputs()
 
 
 def find_depth_hit(context, region, region_3d, mouse_x, mouse_y):
@@ -2267,19 +2362,12 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
 
 
 class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
-    """Monitor gizmo hover and supplied navigation on empty space."""
+    """Monitor gizmo hover and select the native orbit pivot."""
 
     bl_idname = "zb_nav.gizmo_hover_monitor"
     bl_label = "Gizmo Hover Monitor"
     bl_options = {"INTERNAL"}
     _panel_click_consumed = False
-    _middle_orbit = False
-    _middle_press_x = 0
-    _middle_press_y = 0
-    _middle_start_rotation = None
-    _middle_start_location = None
-    _middle_start_distance = 0.0
-    _middle_pivot = None
 
     @classmethod
     def poll(cls, context):
@@ -2290,9 +2378,9 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         if GIZMO_HOVER_MONITOR_RUNNING:
             return {"CANCELLED"}
         GIZMO_HOVER_MONITOR_RUNNING = True
-        self._middle_orbit = False
-        self._middle_pivot = None
         self._panel_click_consumed = False
+        _clear_native_orbit_watch()
+        _clear_orbit_pivot_marker(context)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
@@ -2301,39 +2389,21 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         GIZMO_HOVER_MONITOR_RUNNING = False
         MOVE_MODE_HOVER = None
         self._panel_click_consumed = False
-        self._clear_middle_orbit()
+        _clear_native_orbit_watch()
+        _clear_orbit_pivot_marker(context)
         _restore_all_isolation()
         if context.area:
             context.area.tag_redraw()
         return {"CANCELLED"}
 
-    def _clear_middle_orbit(self):
-        self._middle_orbit = False
-        self._middle_start_rotation = None
-        self._middle_start_location = None
-        self._middle_start_distance = 0.0
-        self._middle_pivot = None
-
-    def _begin_middle_orbit(self, context, event):
-        """Consume a plain MMB orbit and set its pivot explicitly.
-
-        Native Blender only uses the mouse-depth pivot when its Auto Depth
-        preference is enabled.  That preference can be off or can change before
-        the orbit starts, so relying on it makes a surface click unexpectedly
-        orbit around the view centre.  This path is deterministic: a mesh hit
-        uses the exact ray-cast point; empty space uses the sculpt bounds centre.
-        """
+    def _prepare_native_orbit(self, context, event):
+        """Select the pivot and let Blender perform its own rotation."""
+        global NATIVE_ORBIT_INPUT_STATE, NATIVE_ORBIT_WATCH_ACTIVE
         region = context.region
         region_3d = context.region_data
         if region is None or region_3d is None:
             return False
 
-        self._middle_orbit = True
-        self._middle_press_x = event.mouse_region_x
-        self._middle_press_y = event.mouse_region_y
-        self._middle_start_rotation = region_3d.view_rotation.copy()
-        self._middle_start_location = region_3d.view_location.copy()
-        self._middle_start_distance = region_3d.view_distance
         hit, hit_location, hit_obj = find_depth_hit(
             context,
             region,
@@ -2347,60 +2417,33 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
             and hit_obj is not None
             and getattr(hit_obj, "type", None) == "MESH"
         ):
-            self._middle_pivot = hit_location.copy()
+            pivot = hit_location.copy()
+            use_depth = True
         else:
             active_obj = _active_sculpt_object(context)
-            self._middle_pivot = (
+            pivot = (
                 _object_center_within_bounds(active_obj)
                 if active_obj is not None
                 else region_3d.view_location.copy()
             )
-        return True
+            use_depth = False
 
-    def _update_middle_orbit(self, context, event):
-        region = context.region
-        region_3d = context.region_data
-        if (
-            region is None
-            or region_3d is None
-            or self._middle_start_rotation is None
-            or self._middle_start_location is None
-            or self._middle_pivot is None
-        ):
-            return False
-
-        rotation = _trackball_rotation(
-            context,
-            region,
-            self._middle_start_rotation,
-            self._middle_press_x,
-            self._middle_press_y,
-            event.mouse_region_x,
-            event.mouse_region_y,
+        inputs = context.preferences.inputs
+        _restore_native_orbit_inputs()
+        NATIVE_ORBIT_INPUT_STATE = (
+            bool(inputs.use_mouse_depth_navigate),
+            bool(inputs.use_rotate_around_active),
         )
-        _orbit_view_about_pivot(
-            region_3d,
-            self._middle_start_rotation,
-            self._middle_start_location,
-            self._middle_pivot,
-            rotation,
-        )
-        if context.area:
-            context.area.tag_redraw()
-        return True
+        inputs.use_mouse_depth_navigate = use_depth
+        inputs.use_rotate_around_active = not use_depth
 
-    def _cancel_middle_orbit(self, context):
-        region_3d = context.region_data
-        if region_3d is not None:
-            if self._middle_start_rotation is not None:
-                region_3d.view_rotation = self._middle_start_rotation.copy()
-            if self._middle_start_location is not None:
-                region_3d.view_location = self._middle_start_location.copy()
-            if self._middle_start_distance:
-                region_3d.view_distance = self._middle_start_distance
-        self._clear_middle_orbit()
-        if context.area:
-            context.area.tag_redraw()
+        _set_orbit_pivot_marker(context, pivot)
+        NATIVE_ORBIT_WATCH_ACTIVE = True
+        if not bpy.app.timers.is_registered(_native_orbit_watch_timer):
+            bpy.app.timers.register(_native_orbit_watch_timer, first_interval=0.05)
+        if not bpy.app.timers.is_registered(_restore_native_orbit_inputs):
+            bpy.app.timers.register(_restore_native_orbit_inputs, first_interval=0.02)
+        return True
 
     def _zoom_with_mode_sensitivity(self, context, event):
         """Apply ZBrush-mode sensitivity with surface or object-centre pivot."""
@@ -2516,31 +2559,23 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
     def modal(self, context, event):
         global MOVE_MODE_HOVER
         if context.area is None or context.area.type != "VIEW_3D":
-            self._clear_middle_orbit()
+            _clear_native_orbit_watch()
+            _clear_orbit_pivot_marker(context)
             return {"PASS_THROUGH"}
         if not is_navigation_enabled(context):
             MOVE_MODE_HOVER = None
-            self._clear_middle_orbit()
+            _clear_native_orbit_watch()
+            _clear_orbit_pivot_marker(context)
             return {"PASS_THROUGH"}
         if context.mode != "SCULPT":
             MOVE_MODE_HOVER = None
-            self._clear_middle_orbit()
+            _clear_native_orbit_watch()
+            _clear_orbit_pivot_marker(context)
             return {"PASS_THROUGH"}
 
         if event.type in {"CAPSLOCK", "CAPS_LOCK", "CAPSLOCKKEY"} and event.value == "PRESS":
             _trigger_capslock_isolation(context)
             return {"RUNNING_MODAL"}
-
-        if self._middle_orbit:
-            if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
-                self._update_middle_orbit(context, event)
-                return {"RUNNING_MODAL"}
-            if event.type == "MIDDLEMOUSE" and event.value == "RELEASE":
-                self._clear_middle_orbit()
-                return {"RUNNING_MODAL"}
-            if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-                self._cancel_middle_orbit(context)
-                return {"RUNNING_MODAL"}
 
         if self._handle_floating_panel_event(context, event):
             return {"RUNNING_MODAL"}
@@ -2548,17 +2583,17 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         if event.type == "MIDDLEMOUSE" and event.value == "PRESS":
             if not (event.alt or event.ctrl or event.shift or event.oskey):
                 try:
-                    if self._begin_middle_orbit(context, event):
-                        return {"RUNNING_MODAL"}
+                    self._prepare_native_orbit(context, event)
                 except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-                    _draw_error(context, "custom middle orbit", exc)
+                    _draw_error(context, "native middle orbit pivot", exc)
             return {"PASS_THROUGH"}
 
         if event.type == "MIDDLEMOUSE" and event.value == "RELEASE":
             return {"PASS_THROUGH"}
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            self._clear_middle_orbit()
+            _clear_native_orbit_watch()
+            _clear_orbit_pivot_marker(context)
 
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE", "WHEELINMOUSE", "WHEELOUTMOUSE"}:
             try:
@@ -2983,12 +3018,14 @@ def _blender_trackball_vector(region, delta_x, delta_y):
     y = 2.0 * delta_y / size
     length_sq = x * x + y * y
     distance = math.sqrt(length_sq)
-    # Blender uses a sphere inside radius 1/sqrt(2), then a hyperbola outside.
+    radius = BLENDER_TRACKBALL_RADIUS
+    threshold = radius / math.sqrt(2.0)
+    # Blender uses a sphere inside radius 1.1/sqrt(2), then a hyperbola outside.
     # This avoids the direction and speed distortion of plain sphere mapping.
-    if distance < 1.0 / math.sqrt(2.0):
-        z = math.sqrt(max(0.0, 1.0 - length_sq))
+    if distance < threshold:
+        z = math.sqrt(max(0.0, radius * radius - length_sq))
     else:
-        z = 0.5 / max(distance, 1e-8)
+        z = (threshold * threshold) / max(distance, 1e-8)
     return mathutils.Vector((x, y, z))
 
 
@@ -3003,7 +3040,12 @@ def _trackball_rotation(context, region, base_rotation, start_x, start_y, curren
         current_y - start_y,
     )
     sensitivity = context.preferences.inputs.view_rotate_sensitivity_trackball
-    angle = (current - start).length * math.pi * 0.5 * sensitivity
+    angle = (
+        (current - start).length
+        / (2.0 * BLENDER_TRACKBALL_RADIUS)
+        * math.pi
+        * sensitivity
+    )
     angle = (angle + math.pi) % (2.0 * math.pi) - math.pi
     axis = start.cross(current)
     if axis.length < 1e-8:
@@ -3020,7 +3062,7 @@ def _orbit_view_about_pivot(
     pivot,
     new_rotation,
 ):
-    """Match Blender's ``view3d_orbit_apply_dyn_ofs`` around a pivot."""
+    """Match Blender's native ``view3d_orbit_apply_dyn_ofs`` exactly."""
     ofs_old = -start_location
     dyn_ofs = -pivot
     delta = start_rotation.inverted() @ new_rotation
@@ -4004,11 +4046,55 @@ def draw_mask_loop_preview():
         gpu.state.blend_set("NONE")
 
 
+def draw_orbit_pivot_marker():
+    """Draw the world-space pivot used by the active or most recent orbit."""
+    global ORBIT_PIVOT_MARKER, ORBIT_PIVOT_MARKER_VISIBLE
+    marker = ORBIT_PIVOT_MARKER
+    context = bpy.context
+    area = getattr(context, "area", None)
+    if (
+        marker is None
+        or not ORBIT_PIVOT_MARKER_VISIBLE
+        or area is None
+        or getattr(area, "type", None) != "VIEW_3D"
+        or marker.get("area_pointer") != area.as_pointer()
+    ):
+        return
+
+    screen = _to_screen(context, marker["location"])
+    if screen is None:
+        return
+
+    try:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        center = (screen.x, screen.y)
+        gpu.state.blend_set("ALPHA")
+        _draw_filled_circle_2d(
+            shader,
+            center,
+            _px(context, 2.5),
+            (0.10, 0.02, 0.02, 0.45),
+            segments=12,
+        )
+        _draw_filled_circle_2d(
+            shader,
+            center,
+            _px(context, 1.4),
+            (0.72, 0.16, 0.14, 0.95),
+            segments=12,
+        )
+    except Exception as exc:
+        _draw_error(context, "orbit pivot marker", exc)
+    finally:
+        gpu.state.blend_set("NONE")
+
+
 def draw_zb_overlays():
-    """The single POST_PIXEL handler for mask preview, panel and move gizmo."""
+    """The single POST_PIXEL handler for all ZB-Nav viewport overlays."""
     draw_mask_loop_preview()
     draw_floating_tool_panel()
     draw_move_mode_gizmo()
+    draw_orbit_pivot_marker()
 
 
 def register_view3d_draw_handler():
@@ -4094,6 +4180,7 @@ def register():
 def unregister():
     global GIZMO_HOVER_MONITOR_RUNNING
     GIZMO_HOVER_MONITOR_RUNNING = False
+    _clear_orbit_pivot_marker(bpy.context)
     _clear_mask_loop_preview()
     _restore_all_isolation()
     FLOATING_PANEL_STATES.clear()
