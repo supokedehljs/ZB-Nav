@@ -1,7 +1,7 @@
 bl_info = {
     "name": "ZB-Nav",
     "author": "supokede, Cursor",
-    "version": (1, 27, 0),
+    "version": (1, 37, 2),
     "blender": (4, 0, 0),
     "location": "3D View Header > ZBrush",
     "description": "在 Blender 雕刻模式中启用 ZBrush 风格的视图导航子模式",
@@ -16,7 +16,7 @@ import blf
 import bpy
 import gpu
 import mathutils
-from bpy.props import EnumProperty, FloatProperty, FloatVectorProperty, StringProperty
+from bpy.props import FloatProperty, FloatVectorProperty, StringProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
@@ -28,6 +28,7 @@ VIEW_SENSITIVITY_RESTORE_PROP = "_zb_nav_view_sensitivity_restore"
 HEADER_REGISTERED_PROP = "_zb_nav_view3d_header_registered"
 VIEW3D_DRAW_HANDLER = None
 MOVE_MODE_HOVER = None
+MASK_LOOP_PREVIEW = None
 GIZMO_HOVER_MONITOR_RUNNING = False
 # Vertices at or above this mask value are left alone by gizmo transforms.
 MASK_SKIP_THRESHOLD = 0.999
@@ -36,36 +37,28 @@ TOOL_CACHE_SECONDS = 0.15
 _MOVE_TOOL_CACHE = {"time": -1.0, "active": False}
 # Alt+left drag only counts as a drag past this distance, in pixels.
 ALT_DRAG_THRESHOLD = 6.0
-BRUSH_SIZE_MIN_FALLBACK = 1
-BRUSH_SIZE_MAX_FALLBACK = 5000
-# Keymaps the brush size trigger may have to take a key from.
-TRIGGER_KEYMAP_NAMES = (
-    "Window",
-    "Frames",
-    "Sculpt",
-    "3D View",
-    "3D View Generic",
-)
-TRIGGER_KEY_ITEMS = (
-    ("S", "S 键", "按住 S 再按住左键左右拖动"),
-    ("SPACE", "空格键", "按住空格再按住左键左右拖动"),
-)
-_TRIGGER_KEY_YIELDED = None
-_TRIGGER_KEY_YIELDED_ITEMS = []
 _MODE_SHORTCUT_YIELDED_ITEMS = []
 _REPORTED_DRAW_ERRORS = set()
 _CAPSLOCK_LAST_STATE = None
 FLOATING_PANEL_STATES = {}
 ISOLATION_STATES = {}
 
-FLOATING_PANEL_WIDTH = 124.0
-FLOATING_PANEL_TITLE_HEIGHT = 28.0
-FLOATING_PANEL_BUTTON_WIDTH = 52.0
-FLOATING_PANEL_BUTTON_HEIGHT = 40.0
-FLOATING_PANEL_GAP = 6.0
-FLOATING_PANEL_PADDING = 7.0
-FLOATING_PANEL_HALF_HEIGHT = 20.0
-FLOATING_PANEL_SENSITIVITY_HEIGHT = 34.0
+FLOATING_PANEL_WIDTH = 200.0
+FLOATING_PANEL_TITLE_HEIGHT = 27.0
+FLOATING_PANEL_BUTTON_HEIGHT = 30.0
+FLOATING_PANEL_GAP = 1.0
+FLOATING_PANEL_SENSITIVITY_HEIGHT = 30.0
+FLOATING_PANEL_COLORS = {
+    "panel": (0.227, 0.227, 0.227, 1.0),
+    "border": (0.302, 0.302, 0.302, 1.0),
+    "button": (0.169, 0.169, 0.169, 1.0),
+    "button_hover": (0.212, 0.212, 0.212, 1.0),
+    "seam": (0.090, 0.090, 0.090, 1.0),
+    "text": (0.886, 0.886, 0.886, 1.0),
+    "active": (0.941, 0.541, 0.110, 1.0),
+    "active_text": (0.102, 0.102, 0.102, 1.0),
+    "value": (1.0, 0.722, 0.400, 1.0),
+}
 SUBDIVISION_LEVEL_MIN = 0
 SUBDIVISION_LEVEL_MAX = 6
 SUBDIVISION_MODIFIER_NAME = "ZB Nav Subdivision"
@@ -135,6 +128,79 @@ ZBRUSH_KEYMAP_ITEMS = [
         "ctrl": True,
         "properties": {"action": "wire:toggle"},
     },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "zb_nav.mask_loop",
+        "type": "T",
+        "value": "PRESS",
+        "properties": {},
+    },
+    {
+        "keymap": "3D View",
+        "space_type": "VIEW_3D",
+        "idname": "zb_nav.mask_loop",
+        "type": "T",
+        "value": "PRESS",
+        "properties": {},
+    },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "zb_nav.mask_invert",
+        "type": "T",
+        "value": "PRESS",
+        "ctrl": True,
+        "properties": {},
+    },
+    {
+        "keymap": "3D View",
+        "space_type": "VIEW_3D",
+        "idname": "zb_nav.mask_invert",
+        "type": "T",
+        "value": "PRESS",
+        "ctrl": True,
+        "properties": {},
+    },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "zb_nav.mask_clear",
+        "type": "D",
+        "value": "PRESS",
+        "ctrl": True,
+        "properties": {},
+    },
+    {
+        "keymap": "3D View",
+        "space_type": "VIEW_3D",
+        "idname": "zb_nav.mask_clear",
+        "type": "D",
+        "value": "PRESS",
+        "ctrl": True,
+        "properties": {},
+    },
+    {
+        "keymap": "Sculpt",
+        "space_type": "EMPTY",
+        "idname": "wm.radial_control",
+        "type": "F",
+        "value": "PRESS",
+        "properties": {
+            "data_path_primary": "tool_settings.sculpt.brush.size",
+            "data_path_secondary": "tool_settings.sculpt.unified_paint_settings.size",
+            "use_secondary": "tool_settings.sculpt.brush.use_unified_size",
+            "rotation_path": "tool_settings.sculpt.brush.texture_slot.angle",
+            "color_path": "tool_settings.sculpt.brush.cursor_color_add",
+            "fill_color_path": "",
+            "fill_color_override_path": "",
+            "fill_color_override_test_path": "",
+            "zoom_path": "",
+            "image_id": "tool_settings.sculpt.brush",
+            "secondary_tex": False,
+            "release_confirm": True,
+        },
+    },
 ]
 
 def get_preferences(context):
@@ -188,30 +254,18 @@ def _floating_panel_layout(context):
             "y": None,
             "mouse": None,
             "dragging": False,
-            "slider_dragging": False,
             "rotation_slider_dragging": False,
             "zoom_slider_dragging": False,
             "drag_offset": (0.0, 0.0),
         }
         FLOATING_PANEL_STATES[key] = state
 
-    padding = _px(context, FLOATING_PANEL_PADDING)
     gap = _px(context, FLOATING_PANEL_GAP)
     title_height = _px(context, FLOATING_PANEL_TITLE_HEIGHT)
-    button_width = _px(context, FLOATING_PANEL_BUTTON_WIDTH)
     button_height = _px(context, FLOATING_PANEL_BUTTON_HEIGHT)
-    half_height = _px(context, FLOATING_PANEL_HALF_HEIGHT)
     sensitivity_height = _px(context, FLOATING_PANEL_SENSITIVITY_HEIGHT)
     width = _px(context, FLOATING_PANEL_WIDTH)
-    height = (
-        title_height
-        + padding
-        + button_height
-        + gap * 5
-        + half_height * 3
-        + sensitivity_height * 2
-        + padding
-    )
+    height = title_height + gap + button_height * 2 + sensitivity_height * 2 + gap * 3
 
     if state["x"] is None or state["y"] is None:
         stored_position = _pref(context, "floating_panel_position", (0.05, 0.84))
@@ -227,50 +281,51 @@ def _floating_panel_layout(context):
 
     x, y = state["x"], state["y"]
     title_rect = (x, y + height - title_height, width, title_height)
-    inner_width = width - 2.0 * padding
-    cursor_y = y + padding
-    zoom_sensitivity_rect = (x + padding, cursor_y, inner_width, sensitivity_height)
-    cursor_y += sensitivity_height + gap
-    rotation_sensitivity_rect = (x + padding, cursor_y, inner_width, sensitivity_height)
-    cursor_y += sensitivity_height + gap
-    clear_mask_rect = (x + padding, cursor_y, button_width, half_height)
-    invert_mask_rect = (
-        clear_mask_rect[0] + clear_mask_rect[2] + gap,
-        cursor_y,
-        button_width,
-        half_height,
+    content_top = title_rect[1] - gap
+    column_width = (width - gap) * 0.5
+
+    def take_row(row_height):
+        nonlocal content_top
+        rect = (x, content_top - row_height, width, row_height)
+        content_top = rect[1] - gap
+        return rect
+
+    first_row = take_row(button_height)
+    isolate_rect = (first_row[0], first_row[1], column_width, first_row[3])
+    wire_rect = (first_row[0] + column_width + gap, first_row[1], column_width, first_row[3])
+
+    subdivision_row = take_row(button_height)
+    subdivision_rect = (subdivision_row[0], subdivision_row[1], column_width, subdivision_row[3])
+    subdivision_control_x = subdivision_row[0] + column_width + gap
+    arrow_width = min(_px(context, 28.0), column_width * 0.26)
+    subdivision_down_rect = (
+        subdivision_control_x,
+        subdivision_row[1],
+        arrow_width,
+        subdivision_row[3],
     )
-    cursor_y += half_height + gap
-    subdivision_rect = (x + padding, cursor_y, button_width, half_height)
-    subdivision_slider_rect = (
-        subdivision_rect[0] + subdivision_rect[2] + gap,
-        cursor_y,
-        button_width,
-        half_height,
+    subdivision_up_rect = (
+        subdivision_row[0] + subdivision_row[2] - arrow_width,
+        subdivision_row[1],
+        arrow_width,
+        subdivision_row[3],
     )
-    cursor_y += half_height + gap
-    topology_rect = (x + padding, cursor_y, inner_width, half_height)
-    cursor_y += half_height + gap
-    isolate_rect = (
-        x + padding,
-        cursor_y,
-        button_width,
-        button_height,
+    subdivision_value_rect = (
+        subdivision_down_rect[0] + subdivision_down_rect[2] + gap,
+        subdivision_row[1],
+        subdivision_up_rect[0] - subdivision_down_rect[0] - subdivision_down_rect[2] - gap * 2.0,
+        subdivision_row[3],
     )
-    wire_rect = (
-        isolate_rect[0] + isolate_rect[2] + gap,
-        isolate_rect[1],
-        button_width,
-        button_height,
-    )
+
+    rotation_sensitivity_rect = take_row(sensitivity_height)
+    zoom_sensitivity_rect = take_row(sensitivity_height)
     controls = {
         "isolate": isolate_rect,
         "wire": wire_rect,
-        "topology": topology_rect,
         "subdivision": subdivision_rect,
-        "subdivision_slider": subdivision_slider_rect,
-        "clear_mask": clear_mask_rect,
-        "invert_mask": invert_mask_rect,
+        "subdivision_down": subdivision_down_rect,
+        "subdivision_value": subdivision_value_rect,
+        "subdivision_up": subdivision_up_rect,
         "rotation_sensitivity": rotation_sensitivity_rect,
         "zoom_sensitivity": zoom_sensitivity_rect,
     }
@@ -299,16 +354,14 @@ def _floating_panel_hit(context, mouse_x, mouse_y):
         return "action", "isolate:toggle"
     if _point_in_rect(mouse_x, mouse_y, controls["wire"]):
         return "action", "wire:toggle"
-    if _point_in_rect(mouse_x, mouse_y, controls["topology"]):
-        return "action", "topology:toggle"
     if _point_in_rect(mouse_x, mouse_y, controls["subdivision"]):
         return "action", "subdiv:toggle"
-    if _point_in_rect(mouse_x, mouse_y, controls["subdivision_slider"]):
-        return "slider", "subdiv:level"
-    if _point_in_rect(mouse_x, mouse_y, controls["clear_mask"]):
-        return "action", "mask:clear"
-    if _point_in_rect(mouse_x, mouse_y, controls["invert_mask"]):
-        return "action", "mask:invert"
+    if _point_in_rect(mouse_x, mouse_y, controls["subdivision_down"]):
+        return "action", "subdiv:down"
+    if _point_in_rect(mouse_x, mouse_y, controls["subdivision_up"]):
+        return "action", "subdiv:up"
+    if _point_in_rect(mouse_x, mouse_y, controls["subdivision_value"]):
+        return "none", None
     if _point_in_rect(mouse_x, mouse_y, controls["rotation_sensitivity"]):
         return "slider", "rotation:sensitivity"
     if _point_in_rect(mouse_x, mouse_y, controls["zoom_sensitivity"]):
@@ -346,29 +399,11 @@ def _toggle_wire(context):
     return True
 
 
-def _current_sculpt_brush(context):
-    brush = getattr(getattr(context.tool_settings, "sculpt", None), "brush", None)
-    return brush if brush is not None and getattr(brush, "use_paint_sculpt", False) else None
-
-
-def _topology_active(context):
-    brush = _current_sculpt_brush(context)
-    return bool(brush is not None and brush.use_automasking_topology)
-
-
-def _toggle_topology(context):
-    brush = _current_sculpt_brush(context)
-    if brush is None:
-        return False
-    brush.use_automasking_topology = not brush.use_automasking_topology
-    return True
-
-
 def _clear_mask(context):
     obj = _floating_panel_object(context)
-    layer = obj.data.attributes.get(".sculpt_mask") if obj is not None else None
+    layer = _mask_layer_for_object(obj) if obj is not None else None
     if layer is None:
-        return True
+        return obj is not None
     for value in layer.data:
         value.value = 0.0
     obj.data.update()
@@ -378,8 +413,7 @@ def _clear_mask(context):
     return True
 
 
-def _mask_layer(context, create=False):
-    obj = _floating_panel_object(context)
+def _mask_layer_for_object(obj, create=False):
     if obj is None:
         return None
     layer = obj.data.attributes.get(".sculpt_mask")
@@ -389,6 +423,10 @@ def _mask_layer(context, create=False):
         except (RuntimeError, TypeError):
             return None
     return layer
+
+
+def _mask_layer(context, create=False):
+    return _mask_layer_for_object(_floating_panel_object(context), create=create)
 
 
 def _invert_mask(context):
@@ -419,11 +457,11 @@ def _zoom_sensitivity(context):
         return 1.0
 
 
-def _set_sensitivity_preference(context, name, factor):
+def _set_sensitivity_preference(context, name, factor, minimum, maximum):
     prefs = get_preferences(context)
     if prefs is None:
         return False
-    setattr(prefs, name, max(VIEW_SENSITIVITY_MIN, min(VIEW_SENSITIVITY_MAX, float(factor))))
+    setattr(prefs, name, max(minimum, min(maximum, float(factor))))
     return True
 
 
@@ -528,7 +566,7 @@ def _capslock_state():
         # Low-order bit of GetKeyState is the Caps Lock toggle state.
         state = ctypes.windll.user32.GetKeyState(0x14)
         return bool(state & 1)
-    except (AttributeError, OSError):
+    except (AttributeError, OSError, ValueError):
         return None
 
 
@@ -600,20 +638,12 @@ def _restore_all_isolation():
     ISOLATION_STATES.clear()
 
 
-def _set_subdivision_from_slider(context, mouse_x, slider_rect):
+def _set_sensitivity_from_slider(context, name, mouse_x, slider_rect, minimum, maximum):
     if slider_rect[2] <= 0.0:
         return False
     factor = max(0.0, min(1.0, (mouse_x - slider_rect[0]) / slider_rect[2]))
-    level = round(SUBDIVISION_LEVEL_MIN + factor * (SUBDIVISION_LEVEL_MAX - SUBDIVISION_LEVEL_MIN))
-    return _set_subdivision_level(context, level)
-
-
-def _set_sensitivity_from_slider(context, name, mouse_x, slider_rect):
-    if slider_rect[2] <= 0.0:
-        return False
-    factor = max(0.0, min(1.0, (mouse_x - slider_rect[0]) / slider_rect[2]))
-    value = VIEW_SENSITIVITY_MIN + factor * (VIEW_SENSITIVITY_MAX - VIEW_SENSITIVITY_MIN)
-    return _set_sensitivity_preference(context, name, value)
+    value = minimum + factor * (maximum - minimum)
+    return _set_sensitivity_preference(context, name, value, minimum, maximum)
 
 
 def _activate_floating_panel_action(context, action):
@@ -621,14 +651,20 @@ def _activate_floating_panel_action(context, action):
         changed = _toggle_isolation(context)
     elif action == "subdiv:toggle":
         changed = _toggle_subdivision(context)
+    elif action == "subdiv:down":
+        level = _subdivision_level(context)
+        changed = _set_subdivision_level(
+            context,
+            max(SUBDIVISION_LEVEL_MIN, level - 1),
+        )
+    elif action == "subdiv:up":
+        level = _subdivision_level(context)
+        changed = _set_subdivision_level(
+            context,
+            min(SUBDIVISION_LEVEL_MAX, level + 1),
+        )
     elif action == "wire:toggle":
         changed = _toggle_wire(context)
-    elif action == "topology:toggle":
-        changed = _toggle_topology(context)
-    elif action == "mask:clear":
-        changed = _clear_mask(context)
-    elif action == "mask:invert":
-        changed = _invert_mask(context)
     else:
         changed = False
     if changed and context.area:
@@ -729,6 +765,8 @@ def find_depth_hit(context, region, region_3d, mouse_x, mouse_y):
         origin,
         direction,
     )
+    if hit:
+        obj = getattr(obj, "original", obj)
     return hit, location if hit else None, obj if hit else None
 
 
@@ -744,142 +782,6 @@ def location_on_depth(region, region_3d, mouse_x, mouse_y, depth_location):
         (mouse_x, mouse_y),
         depth_location,
     )
-
-
-def _brush_size_owner(context):
-    """Return (owner, property) for the brush size, honouring unified size."""
-    tool_settings = getattr(context, "tool_settings", None)
-    sculpt = getattr(tool_settings, "sculpt", None) if tool_settings else None
-    if sculpt is None:
-        return None, None
-    for unified in (
-        getattr(sculpt, "unified_paint_settings", None),
-        getattr(tool_settings, "unified_paint_settings", None),
-    ):
-        if unified is not None and getattr(unified, "use_unified_size", False):
-            return unified, "size"
-    brush = getattr(sculpt, "brush", None)
-    if brush is not None:
-        return brush, "size"
-    return None, None
-
-
-def _brush_size_limits(owner):
-    """Hard limits of the size property, so the drag can never reach zero."""
-    try:
-        prop = owner.bl_rna.properties["size"]
-        return int(prop.hard_min), int(prop.hard_max)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return BRUSH_SIZE_MIN_FALLBACK, BRUSH_SIZE_MAX_FALLBACK
-
-
-def _brush_size_value(context):
-    owner, name = _brush_size_owner(context)
-    if owner is None:
-        return None
-    try:
-        return int(getattr(owner, name))
-    except (AttributeError, TypeError, ValueError):
-        return None
-
-
-def _set_brush_size(context, value):
-    owner, name = _brush_size_owner(context)
-    if owner is None:
-        return False
-    low, high = _brush_size_limits(owner)
-    target = max(low, min(high, int(round(value))))
-    try:
-        setattr(owner, name, target)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
-def _brush_size_sensitivity(context):
-    try:
-        return max(0.01, float(_pref(context, "brush_size_sensitivity", 0.5)))
-    except (TypeError, ValueError):
-        return 0.5
-
-
-def _brush_size_from_drag(context, start_size, delta_x):
-    """Use a stable brush-size change independent of the starting size."""
-    return start_size + delta_x * _brush_size_sensitivity(context)
-
-
-def _trigger_key_type(context):
-    return "SPACE" if str(_pref(context, "trigger_key", "S")) == "SPACE" else "S"
-
-
-def _trigger_keymap_items(context):
-    """Keymap items for the brush size trigger, following the preference."""
-    trigger = _trigger_key_type(context)
-    return [
-        {
-            "keymap": "3D View",
-            "space_type": "VIEW_3D",
-            "idname": "zb_nav.brush_size_drag",
-            "type": trigger,
-            "value": "PRESS",
-            "properties": {},
-        },
-        {
-            "keymap": "Sculpt",
-            "space_type": "EMPTY",
-            "idname": "zb_nav.brush_size_drag",
-            "type": trigger,
-            "value": "PRESS",
-            "properties": {},
-        },
-    ]
-
-
-def _restore_trigger_key():
-    """Put every yielded native keymap item back exactly as it was."""
-    global _TRIGGER_KEY_YIELDED
-    saved = list(_TRIGGER_KEY_YIELDED_ITEMS)
-    _TRIGGER_KEY_YIELDED_ITEMS.clear()
-    _TRIGGER_KEY_YIELDED = None
-    for item, was_active in saved:
-        try:
-            item.active = was_active
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-            pass
-
-
-def _yield_trigger_key(key_type):
-    """Free up one key so the brush size trigger can use it.
-
-    Only the keymaps this add-on can collide with are touched, only items
-    without modifiers are taken, and every change is remembered for restore.
-    """
-    global _TRIGGER_KEY_YIELDED
-    _restore_trigger_key()
-    if not key_type:
-        return
-    keyconfigs = getattr(bpy.context.window_manager, "keyconfigs", None)
-    keyconfig = getattr(keyconfigs, "user", None) if keyconfigs else None
-    if keyconfig is None:
-        return
-    for keymap in keyconfig.keymaps:
-        if keymap.name not in TRIGGER_KEYMAP_NAMES:
-            continue
-        for item in keymap.keymap_items:
-            if item.type != key_type or not item.active:
-                continue
-            if item.ctrl or item.alt or item.shift or item.oskey:
-                continue
-            if item.key_modifier != "NONE":
-                continue
-            if item.idname.startswith("zb_nav."):
-                continue
-            try:
-                _TRIGGER_KEY_YIELDED_ITEMS.append((item, item.active))
-                item.active = False
-            except (AttributeError, ReferenceError, RuntimeError):
-                continue
-    _TRIGGER_KEY_YIELDED = key_type
 
 
 def _restore_mode_shortcuts():
@@ -899,10 +801,31 @@ def _restore_mode_shortcuts():
             pass
 
 
+def _is_release_confirm_f_item(item):
+    """Identify the radial key configured to confirm when F is released."""
+    if (
+        item.idname != "wm.radial_control"
+        or item.type != "F"
+        or item.ctrl
+        or item.alt
+        or item.shift
+        or item.oskey
+    ):
+        return False
+    try:
+        return (
+            item.properties.data_path_primary == "tool_settings.sculpt.brush.size"
+            and item.properties.release_confirm
+        )
+    except (AttributeError, ReferenceError, RuntimeError):
+        return False
+
+
 def _yield_mode_shortcuts():
-    """Reserve Ctrl+F and Ctrl+A for the ZBrush floating panel."""
+    """Reserve ZBrush panel and edge-loop mask shortcuts."""
     _restore_mode_shortcuts()
     keyconfigs = bpy.context.window_manager.keyconfigs
+    addon_keymap_pointers = {item.as_pointer() for _keymap, item in ADDON_KEYMAPS}
     for keyconfig in keyconfigs:
         if keyconfig.name not in {"Blender", "Blender addon", "Blender user"}:
             continue
@@ -910,7 +833,12 @@ def _yield_mode_shortcuts():
             if keymap.name not in MODE_SHORTCUT_KEYMAPS:
                 continue
             for item_index, item in enumerate(keymap.keymap_items):
-                if not item.active or item.idname.startswith("zb_nav."):
+                if (
+                    not item.active
+                    or item.idname.startswith("zb_nav.")
+                    or item.as_pointer() in addon_keymap_pointers
+                    or _is_release_confirm_f_item(item)
+                ):
                     continue
                 is_ctrl_f = item.type == "F" and item.ctrl and not item.alt and not item.shift and not item.oskey
                 is_ctrl_a = item.type == "A" and item.ctrl and not item.alt and not item.shift and not item.oskey
@@ -922,7 +850,43 @@ def _yield_mode_shortcuts():
                     and not item.shift
                     and not item.oskey
                 )
-                if not (is_ctrl_f or is_ctrl_a or is_ctrl_number) or item.key_modifier != "NONE":
+                is_mask_loop = (
+                    item.type == "T"
+                    and not item.ctrl
+                    and not item.alt
+                    and not item.shift
+                    and not item.oskey
+                )
+                is_mask_invert = (
+                    item.type == "T"
+                    and item.ctrl
+                    and not item.alt
+                    and not item.shift
+                    and not item.oskey
+                )
+                is_mask_clear = (
+                    item.type == "D"
+                    and item.ctrl
+                    and not item.alt
+                    and not item.shift
+                    and not item.oskey
+                )
+                is_plain_f = (
+                    item.type == "F"
+                    and not item.ctrl
+                    and not item.alt
+                    and not item.shift
+                    and not item.oskey
+                )
+                if not (
+                    is_ctrl_f
+                    or is_ctrl_a
+                    or is_ctrl_number
+                    or is_mask_loop
+                    or is_mask_invert
+                    or is_mask_clear
+                    or is_plain_f
+                ) or item.key_modifier != "NONE":
                     continue
                 try:
                     _MODE_SHORTCUT_YIELDED_ITEMS.append((
@@ -937,30 +901,30 @@ def _yield_mode_shortcuts():
                     continue
 
 
-def _sync_trigger_key_state():
-    """Only ever take the key while it can actually be used."""
+def _sync_mode_shortcut_state():
+    """Only take native shortcuts while the ZBrush sculpt sub-mode is active."""
     context = bpy.context
     if is_zbrush_sculpt_mode(context):
-        _yield_trigger_key(_trigger_key_type(context))
+        _set_release_confirm_f_active(True)
         _yield_mode_shortcuts()
     else:
-        _restore_trigger_key()
+        _set_release_confirm_f_active(False)
         _restore_mode_shortcuts()
 
 
-def _trigger_key_sync_timer():
+def _mode_shortcut_sync_timer():
     try:
-        _sync_trigger_key_state()
+        _sync_mode_shortcut_state()
     except Exception as exc:
-        _draw_error(bpy.context, "trigger key sync", exc)
+        _draw_error(bpy.context, "mode shortcut sync", exc)
     return None
 
 
-def _schedule_trigger_key_sync():
+def _schedule_mode_shortcut_sync():
     """Keymap edits run from a timer, never from a draw or keymap callback."""
     try:
-        if not bpy.app.timers.is_registered(_trigger_key_sync_timer):
-            bpy.app.timers.register(_trigger_key_sync_timer, first_interval=0.0)
+        if not bpy.app.timers.is_registered(_mode_shortcut_sync_timer):
+            bpy.app.timers.register(_mode_shortcut_sync_timer, first_interval=0.0)
     except (AttributeError, ValueError):
         pass
 
@@ -978,6 +942,26 @@ def remove_zbrush_keymaps():
         except (ReferenceError, RuntimeError):
             pass
     ADDON_KEYMAPS.clear()
+
+    # Remove keymaps left behind by retired brush-size implementations.
+    for keymap in kc.keymaps:
+        for keymap_item in list(keymap.keymap_items):
+            retired_trigger = keymap_item.idname == "zb_nav.brush_size_drag"
+            retired_custom_radial = keymap_item.idname == "zb_nav.brush_radial"
+            retired_proxy = False
+            if keymap_item.idname == "wm.radial_control":
+                try:
+                    retired_proxy = (
+                        keymap_item.properties.data_path_primary
+                        == "scene.zb_nav_brush_radial.value"
+                    )
+                except (AttributeError, ReferenceError, RuntimeError):
+                    pass
+            if retired_trigger or retired_custom_radial or retired_proxy:
+                try:
+                    keymap.keymap_items.remove(keymap_item)
+                except (ReferenceError, RuntimeError):
+                    pass
 
 
 def _add_keymap_item(item):
@@ -1007,6 +991,22 @@ def _add_keymap_item(item):
             # Radial-control properties differ between Blender versions.
             pass
     ADDON_KEYMAPS.append((km, kmi))
+
+
+def _set_release_confirm_f_active(active):
+    keyconfigs = bpy.context.window_manager.keyconfigs
+    for keyconfig in (keyconfigs.addon, keyconfigs.user):
+        if keyconfig is None:
+            continue
+        for keymap in keyconfig.keymaps:
+            if keymap.name != "Sculpt":
+                continue
+            for keymap_item in keymap.keymap_items:
+                if _is_release_confirm_f_item(keymap_item):
+                    try:
+                        keymap_item.active = bool(active)
+                    except (ReferenceError, RuntimeError):
+                        pass
 
 
 def swap_sculpt_brush_modifiers():
@@ -1264,15 +1264,33 @@ def _sculpt_mask_values(obj, vertex_count):
 
 
 def _mesh_bounds_center(obj):
-    """World-space center of the mesh bounding box."""
+    """World-space center of the currently evaluated mesh bounds."""
     if not obj or not obj.data:
         return mathutils.Vector((0.0, 0.0, 0.0))
-    matrix = obj.matrix_world
-    corners = obj.bound_box
+    source = obj
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        source = obj.evaluated_get(depsgraph)
+    except (AttributeError, ReferenceError, RuntimeError):
+        source = obj
+    matrix = source.matrix_world
+    corners = source.bound_box
     center = mathutils.Vector((0.0, 0.0, 0.0))
     for corner in corners:
         center += matrix @ mathutils.Vector(corner)
     return center / (len(corners) or 1)
+
+
+def _object_center_within_bounds(obj):
+    """Return the world-space centre of the evaluated object bounds.
+
+    The object origin is not used here.  Sculpt meshes commonly keep their
+    origin at the world origin, which would make an empty-space orbit appear to
+    rotate around the world centre instead of around the sculpt itself.
+    """
+    if not obj or not obj.data:
+        return mathutils.Vector((0.0, 0.0, 0.0))
+    return _mesh_bounds_center(obj)
 
 
 def _transform_mesh_in_world(obj, world_transform):
@@ -1535,11 +1553,219 @@ def _active_sculpt_object(context):
     return None
 
 
+def _edge_loop_topology(mesh):
+    """Build the small amount of connectivity needed to trace edge loops."""
+    edge_count = len(mesh.edges)
+    vertex_count = len(mesh.vertices)
+    edge_vertices = [None] * edge_count
+    vertex_edges = [[] for _index in range(vertex_count)]
+    edge_lookup = {}
+
+    for edge in mesh.edges:
+        vertex_a, vertex_b = (int(value) for value in edge.vertices)
+        edge_index = int(edge.index)
+        edge_vertices[edge_index] = (vertex_a, vertex_b)
+        vertex_edges[vertex_a].append(edge_index)
+        vertex_edges[vertex_b].append(edge_index)
+        edge_lookup[(min(vertex_a, vertex_b), max(vertex_a, vertex_b))] = edge_index
+
+    edge_faces = [[] for _index in range(edge_count)]
+    face_edges = []
+    for polygon in mesh.polygons:
+        loop_vertices = [
+            int(mesh.loops[loop_index].vertex_index)
+            for loop_index in range(polygon.loop_start, polygon.loop_start + polygon.loop_total)
+        ]
+        polygon_edges = []
+        for index, vertex_a in enumerate(loop_vertices):
+            vertex_b = loop_vertices[(index + 1) % len(loop_vertices)]
+            edge_index = edge_lookup.get((min(vertex_a, vertex_b), max(vertex_a, vertex_b)))
+            if edge_index is None:
+                continue
+            polygon_edges.append(edge_index)
+            edge_faces[edge_index].append(int(polygon.index))
+        face_edges.append(tuple(polygon_edges))
+
+    return {
+        "edge_vertices": edge_vertices,
+        "vertex_edges": vertex_edges,
+        "edge_faces": edge_faces,
+        "face_edges": face_edges,
+    }
+
+
+def _edge_loop_continuation(vertex_index, current_edge, topology):
+    """Return the next edge of a quad loop, including a boundary loop."""
+    linked_edges = topology["vertex_edges"][vertex_index]
+    if len(linked_edges) < 2:
+        return None
+
+    edge_faces = topology["edge_faces"]
+    boundary_edges = [edge_index for edge_index in linked_edges if len(edge_faces[edge_index]) == 1]
+    if len(boundary_edges) == 2 and len(edge_faces[current_edge]) == 1:
+        for edge_index in boundary_edges:
+            if edge_index != current_edge:
+                return edge_index
+        return None
+
+    if len(linked_edges) != 4:
+        return None
+
+    current_faces = set(edge_faces[current_edge])
+    candidates = []
+    for edge_index in linked_edges:
+        if edge_index == current_edge:
+            continue
+        if current_faces.isdisjoint(edge_faces[edge_index]):
+            candidates.append(edge_index)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _trace_edge_loop(start_edge, topology):
+    """Trace an ordered edge loop from one seed edge."""
+    edge_vertices = topology["edge_vertices"]
+    visited = {start_edge}
+    forward = [start_edge]
+    closed = False
+
+    current_edge = start_edge
+    current_vertex = edge_vertices[start_edge][0]
+    while len(visited) <= len(edge_vertices):
+        next_edge = _edge_loop_continuation(current_vertex, current_edge, topology)
+        if next_edge is None:
+            break
+        if next_edge == start_edge:
+            closed = True
+            break
+        if next_edge in visited:
+            break
+        visited.add(next_edge)
+        forward.append(next_edge)
+        vertex_a, vertex_b = edge_vertices[next_edge]
+        current_vertex = vertex_b if current_vertex == vertex_a else vertex_a
+        current_edge = next_edge
+
+    backward = []
+    current_edge = start_edge
+    current_vertex = edge_vertices[start_edge][1]
+    while len(visited) <= len(edge_vertices):
+        next_edge = _edge_loop_continuation(current_vertex, current_edge, topology)
+        if next_edge is None:
+            break
+        if next_edge == start_edge:
+            closed = True
+            break
+        if next_edge in visited:
+            break
+        visited.add(next_edge)
+        backward.append(next_edge)
+        vertex_a, vertex_b = edge_vertices[next_edge]
+        current_vertex = vertex_b if current_vertex == vertex_a else vertex_a
+        current_edge = next_edge
+
+    return tuple(reversed(backward)) + tuple(forward), closed
+
+
+def _raycast_object_face(context, obj, mouse_x, mouse_y):
+    """Ray-cast the base mesh so the returned polygon matches its topology."""
+    region = context.region
+    region_3d = context.region_data
+    if not region or not region_3d:
+        return None
+
+    coord = (mouse_x, mouse_y)
+    origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+    direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+    inverse = obj.matrix_world.inverted_safe()
+    local_origin = inverse @ origin
+    local_direction = (inverse.to_3x3() @ direction).normalized()
+    hit, _location, _normal, polygon_index = obj.ray_cast(local_origin, local_direction)
+    return int(polygon_index) if hit else None
+
+
+def _find_mask_loop_at_cursor(context, obj, topology, mouse_x, mouse_y):
+    """Find the edge loop nearest the mouse on the ray-cast polygon."""
+    polygon_index = _raycast_object_face(context, obj, mouse_x, mouse_y)
+    if polygon_index is None or polygon_index >= len(topology["face_edges"]):
+        return None
+
+    best_edge = None
+    best_distance = float("inf")
+    matrix = obj.matrix_world
+    vertices = obj.data.vertices
+    for edge_index in topology["face_edges"][polygon_index]:
+        vertex_a, vertex_b = topology["edge_vertices"][edge_index]
+        screen_a = _to_screen(context, matrix @ vertices[vertex_a].co)
+        screen_b = _to_screen(context, matrix @ vertices[vertex_b].co)
+        if screen_a is None or screen_b is None:
+            continue
+        distance = _dist_point_to_segment(
+            mouse_x, mouse_y,
+            screen_a.x, screen_a.y,
+            screen_b.x, screen_b.y,
+        )
+        if distance < best_distance:
+            best_distance = distance
+            best_edge = edge_index
+
+    if best_edge is None:
+        return None
+    edge_loop, closed = _trace_edge_loop(best_edge, topology)
+    return {
+        "edges": edge_loop,
+        "closed": closed,
+    }
+
+
+def _clear_mask_loop_preview():
+    global MASK_LOOP_PREVIEW
+    MASK_LOOP_PREVIEW = None
+    tag_all_view3d_areas_for_redraw()
+
+
+def _set_mask_loop_preview(context, obj, topology, loop):
+    global MASK_LOOP_PREVIEW
+    if not loop:
+        return False
+    loop_vertices = set()
+    for edge_index in loop["edges"]:
+        loop_vertices.update(topology["edge_vertices"][edge_index])
+    MASK_LOOP_PREVIEW = {
+        "object_name": obj.name,
+        "area_pointer": context.area.as_pointer() if context.area else None,
+        "edges": tuple(loop["edges"]),
+        "vertices": tuple(sorted(loop_vertices)),
+        "closed": bool(loop["closed"]),
+    }
+    if context.area:
+        context.area.tag_redraw()
+    return True
+
+
+def _apply_mask_loop(context, obj, preview):
+    if not preview or preview.get("object_name") != obj.name:
+        return False
+    layer = _mask_layer_for_object(obj, create=True)
+    if layer is None:
+        return False
+    vertex_indices = preview["vertices"]
+    if not vertex_indices or max(vertex_indices) >= len(layer.data):
+        return False
+
+    for vertex_index in vertex_indices:
+        layer.data[vertex_index].value = 1.0
+    obj.data.update()
+    obj.update_tag(refresh={"DATA"})
+    tag_all_view3d_areas_for_redraw()
+    return True
+
+
 def find_navigation_pivot(context, region, region_3d, mouse_x, mouse_y):
     """Find the auto-depth pivot for orbiting in ZBrush mode.
 
-    A direct hit on the active sculpt object uses the clicked surface. Any
-    click outside that object uses its mesh-bounds centre.
+    A direct mesh hit always uses the clicked surface. Empty space never
+    contributes a pivot; it falls back to the active sculpt's evaluated
+    geometry centre.
     """
     if not region or not region_3d:
         return None
@@ -1547,12 +1773,18 @@ def find_navigation_pivot(context, region, region_3d, mouse_x, mouse_y):
     hit, hit_location, hit_obj = find_depth_hit(
         context, region, region_3d, mouse_x, mouse_y
     )
-    active_obj = _active_sculpt_object(context)
-    if active_obj is None:
-        return hit_location if hit else region_3d.view_location.copy()
-    if hit and hit_obj == active_obj:
+    if (
+        hit
+        and hit_location is not None
+        and hit_obj is not None
+        and getattr(hit_obj, "type", None) == "MESH"
+    ):
         return hit_location
-    return _mesh_bounds_center(active_obj)
+
+    active_obj = _active_sculpt_object(context)
+    if active_obj is not None:
+        return _object_center_within_bounds(active_obj)
+    return region_3d.view_location.copy()
 
 
 def _matrix_z_to_direction(matrix, world_direction):
@@ -2035,13 +2267,19 @@ class ZBNAV_OT_move_mode_drag(bpy.types.Operator):
 
 
 class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
-    """Passive monitor for gizmo hover and native middle-mouse pivot setup."""
+    """Monitor gizmo hover and supplied navigation on empty space."""
 
     bl_idname = "zb_nav.gizmo_hover_monitor"
     bl_label = "Gizmo Hover Monitor"
     bl_options = {"INTERNAL"}
-    _saved_navigation_options = None
     _panel_click_consumed = False
+    _middle_orbit = False
+    _middle_press_x = 0
+    _middle_press_y = 0
+    _middle_start_rotation = None
+    _middle_start_location = None
+    _middle_start_distance = 0.0
+    _middle_pivot = None
 
     @classmethod
     def poll(cls, context):
@@ -2052,6 +2290,9 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         if GIZMO_HOVER_MONITOR_RUNNING:
             return {"CANCELLED"}
         GIZMO_HOVER_MONITOR_RUNNING = True
+        self._middle_orbit = False
+        self._middle_pivot = None
+        self._panel_click_consumed = False
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
@@ -2060,51 +2301,106 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         GIZMO_HOVER_MONITOR_RUNNING = False
         MOVE_MODE_HOVER = None
         self._panel_click_consumed = False
-        self._restore_navigation_options(context)
+        self._clear_middle_orbit()
         _restore_all_isolation()
         if context.area:
             context.area.tag_redraw()
         return {"CANCELLED"}
 
-    def _restore_navigation_options(self, context):
-        if self._saved_navigation_options is None:
-            return
-        try:
-            inputs = context.preferences.inputs
-            inputs.use_mouse_depth_navigate = self._saved_navigation_options[0]
-            inputs.use_rotate_around_active = self._saved_navigation_options[1]
-        except (AttributeError, TypeError, ValueError):
-            pass
-        self._saved_navigation_options = None
+    def _clear_middle_orbit(self):
+        self._middle_orbit = False
+        self._middle_start_rotation = None
+        self._middle_start_location = None
+        self._middle_start_distance = 0.0
+        self._middle_pivot = None
 
-    def _prepare_native_middle_orbit(self, context, event):
-        obj = _active_sculpt_object(context)
+    def _begin_middle_orbit(self, context, event):
+        """Consume a plain MMB orbit and set its pivot explicitly.
+
+        Native Blender only uses the mouse-depth pivot when its Auto Depth
+        preference is enabled.  That preference can be off or can change before
+        the orbit starts, so relying on it makes a surface click unexpectedly
+        orbit around the view centre.  This path is deterministic: a mesh hit
+        uses the exact ray-cast point; empty space uses the sculpt bounds centre.
+        """
         region = context.region
         region_3d = context.region_data
-        if obj is None or region is None or region_3d is None:
-            return
+        if region is None or region_3d is None:
+            return False
 
-        hit, location, hit_obj = find_depth_hit(
+        self._middle_orbit = True
+        self._middle_press_x = event.mouse_region_x
+        self._middle_press_y = event.mouse_region_y
+        self._middle_start_rotation = region_3d.view_rotation.copy()
+        self._middle_start_location = region_3d.view_location.copy()
+        self._middle_start_distance = region_3d.view_distance
+        hit, hit_location, hit_obj = find_depth_hit(
             context,
             region,
             region_3d,
             event.mouse_region_x,
             event.mouse_region_y,
         )
-        inputs = context.preferences.inputs
-        self._saved_navigation_options = (
-            bool(inputs.use_mouse_depth_navigate),
-            bool(inputs.use_rotate_around_active),
-        )
-        if hit and hit_obj == obj:
-            # Native behavior: orbit around the surface point under the cursor.
-            inputs.use_mouse_depth_navigate = True
-            inputs.use_rotate_around_active = False
+        if (
+            hit
+            and hit_location is not None
+            and hit_obj is not None
+            and getattr(hit_obj, "type", None) == "MESH"
+        ):
+            self._middle_pivot = hit_location.copy()
         else:
-            # Native dynamic offset around the selected object, without moving
-            # the viewport centre or reconstructing the rotation formula.
-            inputs.use_mouse_depth_navigate = False
-            inputs.use_rotate_around_active = True
+            active_obj = _active_sculpt_object(context)
+            self._middle_pivot = (
+                _object_center_within_bounds(active_obj)
+                if active_obj is not None
+                else region_3d.view_location.copy()
+            )
+        return True
+
+    def _update_middle_orbit(self, context, event):
+        region = context.region
+        region_3d = context.region_data
+        if (
+            region is None
+            or region_3d is None
+            or self._middle_start_rotation is None
+            or self._middle_start_location is None
+            or self._middle_pivot is None
+        ):
+            return False
+
+        rotation = _trackball_rotation(
+            context,
+            region,
+            self._middle_start_rotation,
+            self._middle_press_x,
+            self._middle_press_y,
+            event.mouse_region_x,
+            event.mouse_region_y,
+        )
+        _orbit_view_about_pivot(
+            region_3d,
+            self._middle_start_rotation,
+            self._middle_start_location,
+            self._middle_pivot,
+            rotation,
+        )
+        if context.area:
+            context.area.tag_redraw()
+        return True
+
+    def _cancel_middle_orbit(self, context):
+        region_3d = context.region_data
+        if region_3d is not None:
+            if self._middle_start_rotation is not None:
+                region_3d.view_rotation = self._middle_start_rotation.copy()
+            if self._middle_start_location is not None:
+                region_3d.view_location = self._middle_start_location.copy()
+            if self._middle_start_distance:
+                region_3d.view_distance = self._middle_start_distance
+        self._clear_middle_orbit()
+        if context.area:
+            context.area.tag_redraw()
 
     def _zoom_with_mode_sensitivity(self, context, event):
         """Apply ZBrush-mode sensitivity with surface or object-centre pivot."""
@@ -2114,14 +2410,15 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         if obj is None or region is None or region_3d is None:
             return False
 
-        hit, _location, hit_obj = find_depth_hit(
+        pivot = find_navigation_pivot(
             context,
             region,
             region_3d,
             event.mouse_region_x,
             event.mouse_region_y,
         )
-        pivot = location if hit and hit_obj == obj else _mesh_bounds_center(obj)
+        if pivot is None:
+            pivot = _object_center_within_bounds(obj)
 
         zoom_in = event.type in {"WHEELUPMOUSE", "WHEELINMOUSE"}
         inputs = context.preferences.inputs
@@ -2155,17 +2452,12 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
                 if context.area:
                     context.area.tag_redraw()
                 return True
-            if state["slider_dragging"]:
-                _set_subdivision_from_slider(
-                    context, event.mouse_region_x, controls["subdivision_slider"]
-                )
-                if context.area:
-                    context.area.tag_redraw()
-                return True
             if state["rotation_slider_dragging"]:
                 _set_sensitivity_from_slider(
                     context, "rotation_sensitivity", event.mouse_region_x,
                     controls["rotation_sensitivity"],
+                    VIEW_SENSITIVITY_MIN,
+                    VIEW_SENSITIVITY_MAX,
                 )
                 if context.area:
                     context.area.tag_redraw()
@@ -2174,6 +2466,8 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
                 _set_sensitivity_from_slider(
                     context, "zoom_sensitivity", event.mouse_region_x,
                     controls["zoom_sensitivity"],
+                    VIEW_SENSITIVITY_MIN,
+                    VIEW_SENSITIVITY_MAX,
                 )
                 if context.area:
                     context.area.tag_redraw()
@@ -2190,20 +2484,21 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
             if kind == "action" and action is not None:
                 _activate_floating_panel_action(context, action)
             elif kind == "slider":
-                if action == "subdiv:level":
-                    state["slider_dragging"] = True
-                    _set_subdivision_from_slider(context, mouse_x, controls["subdivision_slider"])
-                elif action == "rotation:sensitivity":
+                if action == "rotation:sensitivity":
                     state["rotation_slider_dragging"] = True
                     _set_sensitivity_from_slider(
                         context, "rotation_sensitivity", mouse_x,
                         controls["rotation_sensitivity"],
+                        VIEW_SENSITIVITY_MIN,
+                        VIEW_SENSITIVITY_MAX,
                     )
                 elif action == "zoom:sensitivity":
                     state["zoom_slider_dragging"] = True
                     _set_sensitivity_from_slider(
                         context, "zoom_sensitivity", mouse_x,
                         controls["zoom_sensitivity"],
+                        VIEW_SENSITIVITY_MIN,
+                        VIEW_SENSITIVITY_MAX,
                     )
             if _point_in_rect(mouse_x, mouse_y, panel_rect):
                 self._panel_click_consumed = True
@@ -2211,7 +2506,6 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
 
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
             state["dragging"] = False
-            state["slider_dragging"] = False
             state["rotation_slider_dragging"] = False
             state["zoom_slider_dragging"] = False
             if self._panel_click_consumed:
@@ -2222,20 +2516,31 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
     def modal(self, context, event):
         global MOVE_MODE_HOVER
         if context.area is None or context.area.type != "VIEW_3D":
-            self._restore_navigation_options(context)
+            self._clear_middle_orbit()
             return {"PASS_THROUGH"}
         if not is_navigation_enabled(context):
             MOVE_MODE_HOVER = None
-            self._restore_navigation_options(context)
+            self._clear_middle_orbit()
             return {"PASS_THROUGH"}
         if context.mode != "SCULPT":
             MOVE_MODE_HOVER = None
-            self._restore_navigation_options(context)
+            self._clear_middle_orbit()
             return {"PASS_THROUGH"}
 
         if event.type in {"CAPSLOCK", "CAPS_LOCK", "CAPSLOCKKEY"} and event.value == "PRESS":
             _trigger_capslock_isolation(context)
             return {"RUNNING_MODAL"}
+
+        if self._middle_orbit:
+            if event.type in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE"}:
+                self._update_middle_orbit(context, event)
+                return {"RUNNING_MODAL"}
+            if event.type == "MIDDLEMOUSE" and event.value == "RELEASE":
+                self._clear_middle_orbit()
+                return {"RUNNING_MODAL"}
+            if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+                self._cancel_middle_orbit(context)
+                return {"RUNNING_MODAL"}
 
         if self._handle_floating_panel_event(context, event):
             return {"RUNNING_MODAL"}
@@ -2243,17 +2548,17 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         if event.type == "MIDDLEMOUSE" and event.value == "PRESS":
             if not (event.alt or event.ctrl or event.shift or event.oskey):
                 try:
-                    self._prepare_native_middle_orbit(context, event)
+                    if self._begin_middle_orbit(context, event):
+                        return {"RUNNING_MODAL"}
                 except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-                    _draw_error(context, "native middle orbit prepare", exc)
+                    _draw_error(context, "custom middle orbit", exc)
             return {"PASS_THROUGH"}
 
         if event.type == "MIDDLEMOUSE" and event.value == "RELEASE":
-            self._restore_navigation_options(context)
             return {"PASS_THROUGH"}
 
         if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
-            self._restore_navigation_options(context)
+            self._clear_middle_orbit()
 
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE", "WHEELINMOUSE", "WHEELOUTMOUSE"}:
             try:
@@ -2276,72 +2581,115 @@ class ZBNAV_OT_gizmo_hover_monitor(bpy.types.Operator):
         return {"PASS_THROUGH"}
 
 
-class ZBNAV_OT_brush_size_drag(bpy.types.Operator):
-    """按住触发键 + 左键左右拖动调整笔刷大小。"""
+class ZBNAV_OT_mask_loop(bpy.types.Operator):
+    """Move over a mesh edge, then release T to mask its edge loop."""
 
-    bl_idname = "zb_nav.brush_size_drag"
-    bl_label = "Brush Size Drag"
-    bl_description = "按住触发键再按住左键左右拖动，调整笔刷大小"
-    bl_options = {"INTERNAL"}
-
-    _start_mouse_x = 0
-    _start_size = 0
-    _dragging = False
+    bl_idname = "zb_nav.mask_loop"
+    bl_label = "Mask Edge Loop"
+    bl_description = "按住 T 移动鼠标选择边环，松开 T 将边环遮罩"
+    bl_options = {"REGISTER", "UNDO", "BLOCKING"}
 
     @classmethod
     def poll(cls, context):
-        return is_zbrush_sculpt_mode(context) and _brush_size_owner(context)[0] is not None
+        return is_zbrush_sculpt_mode(context) and _active_sculpt_object(context) is not None
 
     def invoke(self, context, event):
-        if event.type != _trigger_key_type(context) or event.value != "PRESS":
+        if (
+            event.type != "T"
+            or event.value != "PRESS"
+            or event.ctrl
+            or event.alt
+            or event.shift
+        ):
             return {"PASS_THROUGH"}
-        size = _brush_size_value(context)
-        if size is None:
-            return {"PASS_THROUGH"}
+        obj = _active_sculpt_object(context)
+        if obj is None:
+            return {"CANCELLED"}
 
-        self._start_size = size
-        self._start_mouse_x = event.mouse_region_x
-        self._dragging = False
+        self._object_name = obj.name
+        self._topology = _edge_loop_topology(obj.data)
+        self._mesh_sizes = (len(obj.data.vertices), len(obj.data.edges))
+        self._last_mouse = (event.mouse_region_x, event.mouse_region_y)
+        self._update_preview(context)
         context.window_manager.modal_handler_add(self)
         return {"RUNNING_MODAL"}
 
-    def _finish(self, context):
-        self._dragging = False
-        return {"FINISHED"}
+    def _update_preview(self, context):
+        obj = _active_sculpt_object(context)
+        if obj is None or obj.name != self._object_name:
+            return False
+        mesh_sizes = (len(obj.data.vertices), len(obj.data.edges))
+        if mesh_sizes != self._mesh_sizes:
+            self._topology = _edge_loop_topology(obj.data)
+            self._mesh_sizes = mesh_sizes
+        loop = _find_mask_loop_at_cursor(
+            context,
+            obj,
+            self._topology,
+            self._last_mouse[0],
+            self._last_mouse[1],
+        )
+        return _set_mask_loop_preview(context, obj, self._topology, loop)
 
-    def _cancel(self, context):
-        if self._dragging:
-            _set_brush_size(context, self._start_size)
-        return self._finish(context)
+    def _finish(self, context, apply_mask):
+        obj = _active_sculpt_object(context)
+        changed = bool(
+            apply_mask
+            and obj is not None
+            and _apply_mask_loop(context, obj, MASK_LOOP_PREVIEW)
+        )
+        _clear_mask_loop_preview()
+        return {"FINISHED"} if changed else {"CANCELLED"}
 
     def modal(self, context, event):
-        trigger = _trigger_key_type(context)
-
-        if event.type == "ESC" and event.value == "PRESS":
-            return self._cancel(context)
-        if event.type == trigger and event.value == "RELEASE":
-            return self._finish(context)
         if not is_zbrush_sculpt_mode(context):
-            return self._cancel(context)
+            return self._finish(context, apply_mask=False)
 
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            self._start_mouse_x = event.mouse_region_x
-            self._dragging = True
+        obj = _active_sculpt_object(context)
+        if obj is None or obj.name != self._object_name:
+            return self._finish(context, apply_mask=False)
+
+        if event.type == "T" and event.value == "RELEASE":
+            return self._finish(context, apply_mask=True)
+        if event.type in {"ESC", "RIGHTMOUSE"} and event.value == "PRESS":
+            return self._finish(context, apply_mask=False)
+        if event.type == "MOUSEMOVE":
+            self._last_mouse = (event.mouse_region_x, event.mouse_region_y)
+            self._update_preview(context)
             return {"RUNNING_MODAL"}
-
-        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
-            if self._dragging:
-                return self._finish(context)
-            return {"RUNNING_MODAL"}
-
-        if event.type == "MOUSEMOVE" and self._dragging:
-            delta_x = event.mouse_region_x - self._start_mouse_x
-            target = _brush_size_from_drag(context, self._start_size, delta_x)
-            if _set_brush_size(context, target) and context.area:
-                context.area.tag_redraw()
-            return {"RUNNING_MODAL"}
-
         return {"RUNNING_MODAL"}
+
+
+class ZBNAV_OT_mask_invert(bpy.types.Operator):
+    """Invert the complete sculpt mask."""
+
+    bl_idname = "zb_nav.mask_invert"
+    bl_label = "Invert Sculpt Mask"
+    bl_description = "反转当前雕刻对象的全部遮罩"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context) and _active_sculpt_object(context) is not None
+
+    def execute(self, context):
+        return {"FINISHED"} if _invert_mask(context) else {"CANCELLED"}
+
+
+class ZBNAV_OT_mask_clear(bpy.types.Operator):
+    """Clear the complete sculpt mask."""
+
+    bl_idname = "zb_nav.mask_clear"
+    bl_label = "Clear Sculpt Mask"
+    bl_description = "清除当前雕刻对象的全部遮罩"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_zbrush_sculpt_mode(context) and _active_sculpt_object(context) is not None
+
+    def execute(self, context):
+        return {"FINISHED"} if _clear_mask(context) else {"CANCELLED"}
 
 
 def add_zbrush_keymaps(context=None):
@@ -2350,8 +2698,7 @@ def add_zbrush_keymaps(context=None):
     swap_sculpt_brush_modifiers()
     for item in ZBRUSH_KEYMAP_ITEMS:
         _add_keymap_item(item)
-    for item in _trigger_keymap_items(context):
-        _add_keymap_item(item)
+    _set_release_confirm_f_active(is_zbrush_sculpt_mode(context))
 
 
 def update_navigation_mode(context, mode):
@@ -2363,6 +2710,7 @@ def update_navigation_mode(context, mode):
     elif was_enabled:
         _restore_rotate_method(context)
         _restore_all_isolation()
+        _clear_mask_loop_preview()
     if (
         mode == "ZBRUSH"
         and context.mode == "SCULPT"
@@ -2380,7 +2728,7 @@ def update_navigation_mode(context, mode):
     else:
         _CAPSLOCK_LAST_STATE = None
     tag_all_view3d_areas_for_redraw()
-    _schedule_trigger_key_sync()
+    _schedule_mode_shortcut_sync()
     return True
 
 
@@ -2401,40 +2749,11 @@ def _sculpt_mode_handler(scene, depsgraph):
             update_navigation_mode(context, "ZBRUSH")
         except Exception as exc:
             _draw_error(context, "sculpt mode handler", exc)
-    _schedule_trigger_key_sync()
-
-
-def _on_trigger_key_changed(self, context):
-    """Re-register the trigger keymap and free up the newly chosen key."""
-    try:
-        add_zbrush_keymaps(context)
-    except Exception as exc:
-        _draw_error(context, "trigger key update", exc)
-    _schedule_trigger_key_sync()
+    _schedule_mode_shortcut_sync()
 
 
 class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
-
-    trigger_key: EnumProperty(
-        name="触发键",
-        description="按住它再按住左键左右拖动，即可调整笔刷大小",
-        items=TRIGGER_KEY_ITEMS,
-        default="S",
-        update=_on_trigger_key_changed,
-    )
-
-    brush_size_sensitivity: FloatProperty(
-        name="笔刷灵敏度",
-        description="每像素拖动改变多少笔刷大小（相对当前大小）",
-        default=0.5,
-        min=0.05,
-        max=5.0,
-        soft_min=0.1,
-        soft_max=2.0,
-        step=1,
-        precision=2,
-    )
 
     rotation_sensitivity: FloatProperty(
         name="旋转灵敏度",
@@ -2511,9 +2830,6 @@ class ZBNAV_AddonPreferences(bpy.types.AddonPreferences):
 
         column = layout.column(align=True)
         row = column.row(align=True)
-        row.prop(self, "trigger_key", text="触发键")
-        row.prop(self, "brush_size_sensitivity", text="笔刷", slider=True)
-        row = column.row(align=True)
         row.prop(self, "rotation_sensitivity", text="旋转灵敏度", slider=True)
         row.prop(self, "zoom_sensitivity", text="缩放灵敏度", slider=True)
 
@@ -2573,7 +2889,7 @@ class ZBNAV_OT_pan_or_zoom(bpy.types.Operator):
         if self._last_depth_location is None:
             obj = _active_sculpt_object(context)
             if obj is not None:
-                self._last_depth_location = _mesh_bounds_center(obj)
+                self._last_depth_location = _object_center_within_bounds(obj)
         self._pivot_location = self._last_depth_location or self._start_view_location.copy()
         self._was_alt_pressed = event.alt
         self._converted_pan_to_zoom = False
@@ -2889,8 +3205,42 @@ def _rounded_rect_points(rect, radius, segments=6):
     return points
 
 
+def _rounded_rect_points_corners(rect, radii, segments=6):
+    """Rounded rectangle points with (bottom-left, br, tr, top-left) radii."""
+    x, y, width, height = rect
+    radius_bl, radius_br, radius_tr, radius_tl = [
+        max(0.0, min(float(radius), width * 0.5, height * 0.5))
+        for radius in radii
+    ]
+    points = []
+    corners = (
+        (x + width - radius_br, y + radius_br, -math.pi * 0.5, 0.0, radius_br),
+        (x + width - radius_tr, y + height - radius_tr, 0.0, math.pi * 0.5, radius_tr),
+        (x + radius_tl, y + height - radius_tl, math.pi * 0.5, math.pi, radius_tl),
+        (x + radius_bl, y + radius_bl, math.pi, math.pi * 1.5, radius_bl),
+    )
+    for cx, cy, start, end, radius in corners:
+        for step in range(segments + 1):
+            angle = start + (end - start) * step / segments
+            points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+    return points
+
+
 def _draw_rounded_rect_2d(shader, rect, radius, color):
     points = _rounded_rect_points(rect, radius)
+    x, y, width, height = rect
+    center = (x + width * 0.5, y + height * 0.5)
+    verts = []
+    for index, point in enumerate(points):
+        verts.extend((center, point, points[(index + 1) % len(points)]))
+    batch = batch_for_shader(shader, "TRIS", {"pos": verts})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+
+def _draw_rounded_rect_corners_2d(shader, rect, radii, color):
+    points = _rounded_rect_points_corners(rect, radii)
     x, y, width, height = rect
     center = (x + width * 0.5, y + height * 0.5)
     verts = []
@@ -2921,53 +3271,6 @@ def _draw_centered_text_2d(x, y, width, height, text, size, color):
         size,
         color,
     )
-
-
-def _draw_tool_button_icon(shader, context, action, rect, color):
-    """Draw the two icons used by the compact tool panel."""
-    x, y, width, height = rect
-    cx, cy = x + width * 0.5, y + height * 0.5
-    s = min(width, height)
-    line_width = max(1.0, _px(context, 1.6))
-    gpu.state.line_width_set(line_width)
-
-    if action == "isolate:toggle":
-        half = s * 0.23
-        arm = s * 0.09
-        for xs, ys in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
-            px, py = cx + xs * half, cy + ys * half
-            _draw_line_2d(shader, (px, py), (px - xs * arm, py), color)
-            _draw_line_2d(shader, (px, py), (px, py - ys * arm), color)
-        _draw_circle_outline_2d(shader, (cx, cy), s * 0.10, color, line_width, 18)
-        _draw_filled_circle_2d(shader, (cx, cy), s * 0.035, color, segments=10)
-    elif action == "wire:toggle":
-        half = s * 0.23
-        _draw_polyline_2d(
-            shader,
-            [
-                (cx - half, cy - half), (cx + half, cy - half),
-                (cx + half, cy + half), (cx - half, cy + half),
-                (cx - half, cy - half),
-            ],
-            color,
-        )
-        for offset in (-half / 3.0, half / 3.0):
-            _draw_line_2d(shader, (cx - half, cy + offset), (cx + half, cy + offset), color)
-            _draw_line_2d(shader, (cx + offset, cy - half), (cx + offset, cy + half), color)
-    elif action == "subdiv:toggle":
-        half = s * 0.24
-        _draw_polyline_2d(
-            shader,
-            [
-                (cx - half, cy - half), (cx, cy), (cx + half, cy - half),
-                (cx + half, cy + half), (cx, cy), (cx - half, cy + half),
-                (cx - half, cy - half),
-            ],
-            color,
-        )
-        _draw_line_2d(shader, (cx - half, cy), (cx + half, cy), color)
-        _draw_line_2d(shader, (cx, cy - half), (cx, cy + half), color)
-    gpu.state.line_width_set(1.0)
 
 
 def _draw_tri_along_axis(shader, apex, base, color, half_width):
@@ -3193,11 +3496,10 @@ def draw_floating_tool_panel():
     state, (x, y, width, height), title_rect, controls = layout
     isolate_rect = controls["isolate"]
     wire_rect = controls["wire"]
-    topology_rect = controls["topology"]
     subdiv_rect = controls["subdivision"]
-    slider_rect = controls["subdivision_slider"]
-    clear_mask_rect = controls["clear_mask"]
-    invert_mask_rect = controls["invert_mask"]
+    subdiv_down_rect = controls["subdivision_down"]
+    subdiv_value_rect = controls["subdivision_value"]
+    subdiv_up_rect = controls["subdivision_up"]
     rotation_sensitivity_rect = controls["rotation_sensitivity"]
     zoom_sensitivity_rect = controls["zoom_sensitivity"]
     ui = _ui_scale(context)
@@ -3205,51 +3507,55 @@ def draw_floating_tool_panel():
     gpu.state.blend_set("ALPHA")
 
     try:
-        panel_radius = _px(context, 7)
-        button_radius = _px(context, 5)
+        colors = FLOATING_PANEL_COLORS
+        panel_radius = _px(context, 6)
         _draw_rounded_rect_2d(
             shader,
-            (x + _px(context, 3), y - _px(context, 3), width, height),
+            (x + _px(context, 2), y - _px(context, 2), width, height),
             panel_radius,
-            (0.0, 0.0, 0.0, 0.35),
+            (0.0, 0.0, 0.0, 0.28),
         )
-        _draw_rounded_rect_2d(shader, (x, y, width, height), panel_radius, (0.105, 0.11, 0.115, 0.97))
-        _draw_rounded_rect_2d(shader, title_rect, panel_radius, (0.19, 0.195, 0.20, 0.99))
-        panel_points = _rounded_rect_points((x, y, width, height), panel_radius)
-        outline = panel_points + [panel_points[0]]
-        _draw_polyline_2d(shader, outline, (0.38, 0.40, 0.44, 0.95))
+        _draw_rounded_rect_2d(shader, (x, y, width, height), panel_radius, colors["panel"])
+        _draw_rounded_rect_corners_2d(
+            shader,
+            title_rect,
+            (0.0, 0.0, panel_radius, panel_radius),
+            colors["button"],
+        )
+        content_rect = (x, y, width, height - title_rect[3] - _px(context, 1))
+        _draw_rounded_rect_corners_2d(
+            shader,
+            content_rect,
+            (panel_radius, panel_radius, 0.0, 0.0),
+            colors["seam"],
+        )
+        panel_points = _rounded_rect_points((x, y, width, height), panel_radius, segments=8)
+        _draw_polyline_2d(shader, panel_points + [panel_points[0]], colors["border"])
 
         mouse = state.get("mouse")
         hovered_tip = None
 
-        def draw_button(rect, active, hovered):
+        def draw_button(rect, active, hovered, radii=(0.0, 0.0, 0.0, 0.0)):
             if active:
-                fill = (1.0, 0.48, 0.06, 0.99)
+                fill = colors["active"]
             elif hovered:
-                fill = (0.245, 0.25, 0.27, 0.99)
+                fill = colors["button_hover"]
             else:
-                fill = (0.185, 0.19, 0.20, 0.98)
-            _draw_rounded_rect_2d(shader, rect, button_radius, fill)
-            points = _rounded_rect_points(rect, button_radius)
-            _draw_polyline_2d(shader, points + [points[0]], (0.34, 0.35, 0.37, 0.85))
-            return (0.10, 0.075, 0.025, 1.0) if active else (0.94, 0.95, 0.97, 1.0)
+                fill = colors["button"]
+            if any(radii):
+                _draw_rounded_rect_corners_2d(shader, rect, radii, fill)
+            else:
+                _draw_rect_2d(shader, rect, fill)
+            return colors["active_text"] if active else colors["text"]
 
         isolate_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], isolate_rect)
         isolate_active = _isolation_active(context)
         isolate_color = draw_button(isolate_rect, isolate_active, isolate_hovered)
         if isolate_hovered:
             hovered_tip = "孤立当前物体"
-        _draw_tool_button_icon(
-            shader,
-            context,
-            "isolate:toggle",
-            (isolate_rect[0] + _px(context, 9), isolate_rect[1] + _px(context, 10),
-             isolate_rect[2] - _px(context, 18), isolate_rect[3] - _px(context, 18)),
-            isolate_color,
-        )
         _draw_centered_text_2d(
-            isolate_rect[0], isolate_rect[1] + _px(context, 2),
-            isolate_rect[2], _px(context, 11), "孤立", 8.5 * ui, isolate_color,
+            isolate_rect[0], isolate_rect[1], isolate_rect[2], isolate_rect[3],
+            "孤立", 12.5 * ui, isolate_color,
         )
 
         wire_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], wire_rect)
@@ -3257,27 +3563,9 @@ def draw_floating_tool_panel():
         wire_color = draw_button(wire_rect, wire_active, wire_hovered)
         if wire_hovered:
             hovered_tip = "显示面边线线框"
-        _draw_tool_button_icon(
-            shader,
-            context,
-            "wire:toggle",
-            (wire_rect[0] + _px(context, 9), wire_rect[1] + _px(context, 10),
-             wire_rect[2] - _px(context, 18), wire_rect[3] - _px(context, 18)),
-            wire_color,
-        )
         _draw_centered_text_2d(
-            wire_rect[0], wire_rect[1] + _px(context, 2),
-            wire_rect[2], _px(context, 11), "线框", 8.5 * ui, wire_color,
-        )
-
-        topology_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], topology_rect)
-        topology_active = _topology_active(context)
-        topology_color = draw_button(topology_rect, topology_active, topology_hovered)
-        if topology_hovered:
-            hovered_tip = "切换当前笔刷的自动遮罩拓扑"
-        _draw_centered_text_2d(
-            topology_rect[0], topology_rect[1], topology_rect[2], topology_rect[3],
-            "自动遮罩拓扑", 9.0 * ui, topology_color,
+            wire_rect[0], wire_rect[1], wire_rect[2], wire_rect[3],
+            "线框", 12.5 * ui, wire_color,
         )
 
         subdiv_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], subdiv_rect)
@@ -3287,113 +3575,110 @@ def draw_floating_tool_panel():
             hovered_tip = "细分显示开关"
         _draw_centered_text_2d(
             subdiv_rect[0], subdiv_rect[1], subdiv_rect[2], subdiv_rect[3],
-            "细分", 9.0 * ui, subdiv_color,
+            "细分", 12.5 * ui, subdiv_color,
         )
 
         level = _subdivision_level(context)
         has_subdivision = level is not None
-        slider_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], slider_rect)
-        if slider_hovered:
+        down_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], subdiv_down_rect)
+        value_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], subdiv_value_rect)
+        up_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], subdiv_up_rect)
+        if down_hovered or value_hovered or up_hovered:
             hovered_tip = "细分级别"
-        _draw_rounded_rect_2d(
-            shader, slider_rect, button_radius,
-            (0.13, 0.135, 0.14, 0.96)
-            if not has_subdivision
-            else ((0.19, 0.195, 0.205, 0.99) if slider_hovered else (0.145, 0.15, 0.16, 0.98)),
-        )
-        track_left = slider_rect[0] + _px(context, 6)
-        track_right = slider_rect[0] + slider_rect[2] - _px(context, 6)
-        track_y = slider_rect[1] + _px(context, 5)
-        _draw_line_2d(shader, (track_left, track_y), (track_right, track_y), (0.38, 0.40, 0.43, 1.0))
-        factor = (
-            (level - SUBDIVISION_LEVEL_MIN)
-            / max(1, SUBDIVISION_LEVEL_MAX - SUBDIVISION_LEVEL_MIN)
-            if has_subdivision else 0.0
-        )
-        knob_x = track_left + (track_right - track_left) * factor
-        _draw_filled_circle_2d(
-            shader, (knob_x, track_y), _px(context, 3.0),
-            (1.0, 0.48, 0.06, 1.0) if has_subdivision else (0.38, 0.39, 0.41, 1.0),
-            segments=12,
+        down_color = draw_button(subdiv_down_rect, False, down_hovered)
+        draw_button(subdiv_value_rect, False, value_hovered)
+        up_color = draw_button(subdiv_up_rect, False, up_hovered)
+        _draw_centered_text_2d(
+            subdiv_down_rect[0], subdiv_down_rect[1], subdiv_down_rect[2], subdiv_down_rect[3],
+            "◂", 15.0 * ui, down_color,
         )
         _draw_centered_text_2d(
-            slider_rect[0], slider_rect[1] + _px(context, 8),
-            slider_rect[2], slider_rect[3] - _px(context, 8),
+            subdiv_up_rect[0], subdiv_up_rect[1], subdiv_up_rect[2], subdiv_up_rect[3],
+            "▸", 15.0 * ui, up_color,
+        )
+        _draw_centered_text_2d(
+            subdiv_value_rect[0], subdiv_value_rect[1], subdiv_value_rect[2], subdiv_value_rect[3],
             str(level) if has_subdivision else "—",
-            8.5 * ui,
-            (0.86, 0.88, 0.92, 1.0) if has_subdivision else (0.42, 0.44, 0.48, 1.0),
+            12.5 * ui,
+            colors["value"] if has_subdivision else colors["text"],
         )
 
-        clear_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], clear_mask_rect)
-        clear_color = draw_button(clear_mask_rect, False, clear_hovered)
-        if clear_hovered:
-            hovered_tip = "清除全部遮罩"
-        _draw_centered_text_2d(
-            clear_mask_rect[0], clear_mask_rect[1], clear_mask_rect[2], clear_mask_rect[3],
-            "取消遮罩", 8.5 * ui, clear_color,
-        )
-
-        invert_hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], invert_mask_rect)
-        invert_color = draw_button(invert_mask_rect, False, invert_hovered)
-        if invert_hovered:
-            hovered_tip = "反转全部遮罩"
-        _draw_centered_text_2d(
-            invert_mask_rect[0], invert_mask_rect[1], invert_mask_rect[2], invert_mask_rect[3],
-            "反转遮罩", 8.5 * ui, invert_color,
-        )
-
-        def draw_sensitivity_slider(rect, label, value):
+        def draw_sensitivity_slider(rect, label, value, minimum, maximum, radii):
             hovered = mouse is not None and _point_in_rect(mouse[0], mouse[1], rect)
-            _draw_rounded_rect_2d(
-                shader, rect, button_radius,
-                (0.19, 0.195, 0.205, 0.99) if hovered else (0.145, 0.15, 0.16, 0.98),
-            )
-            track_left = rect[0] + _px(context, 8)
-            track_right = rect[0] + rect[2] - _px(context, 8)
-            track_y = rect[1] + _px(context, 7)
-            _draw_text_2d(
-                rect[0] + _px(context, 8),
-                rect[1] + rect[3] - _px(context, 14),
-                f"{label}  {value:.2f}",
-                9.0 * ui,
-                (0.86, 0.88, 0.92, 1.0),
-            )
-            _draw_line_2d(
-                shader, (track_left, track_y), (track_right, track_y),
-                (0.38, 0.40, 0.43, 1.0),
-            )
+            fill = colors["button_hover"] if hovered else colors["button"]
+            if any(radii):
+                _draw_rounded_rect_corners_2d(shader, rect, radii, fill)
+            else:
+                _draw_rect_2d(shader, rect, fill)
             factor = (
-                (value - VIEW_SENSITIVITY_MIN)
-                / max(1e-6, VIEW_SENSITIVITY_MAX - VIEW_SENSITIVITY_MIN)
+                (value - minimum)
+                / max(1e-6, maximum - minimum)
             )
-            knob_x = track_left + (track_right - track_left) * factor
-            _draw_filled_circle_2d(
-                shader, (knob_x, track_y), _px(context, 3.2),
-                (1.0, 0.48, 0.06, 1.0), segments=12,
+            font_size = max(8.0, 12.0 * ui)
+            blf.size(0, int(font_size))
+            _label_width, text_height = blf.dimensions(0, label)
+            text_y = rect[1] + max(0.0, (rect[3] - text_height) * 0.5) + _px(context, 1.0)
+            _draw_text_2d(
+                rect[0] + _px(context, 10),
+                text_y,
+                label,
+                font_size,
+                colors["text"],
+            )
+            value_text = f"{value:.2f}"
+            value_width, _value_height = blf.dimensions(0, value_text)
+            _draw_text_2d(
+                rect[0] + rect[2] - value_width - _px(context, 10),
+                text_y,
+                value_text,
+                font_size,
+                colors["value"],
+            )
+            track_left = rect[0] + _px(context, 1)
+            track_width = max(0.0, rect[2] - _px(context, 2))
+            _draw_rect_2d(
+                shader,
+                (track_left, rect[1], track_width, _px(context, 3)),
+                colors["seam"],
+            )
+            _draw_rect_2d(
+                shader,
+                (track_left, rect[1], track_width * factor, _px(context, 3)),
+                colors["active"],
             )
             return hovered
 
         if draw_sensitivity_slider(
-            rotation_sensitivity_rect, "旋转敏感度", _rotation_sensitivity(context)
+            rotation_sensitivity_rect,
+            "旋转敏感度",
+            _rotation_sensitivity(context),
+            VIEW_SENSITIVITY_MIN,
+            VIEW_SENSITIVITY_MAX,
+            (0.0, 0.0, 0.0, 0.0),
         ):
             hovered_tip = "ZBrush 模式下的视图旋转敏感度"
         if draw_sensitivity_slider(
-            zoom_sensitivity_rect, "缩放敏感度", _zoom_sensitivity(context)
+            zoom_sensitivity_rect,
+            "缩放敏感度",
+            _zoom_sensitivity(context),
+            VIEW_SENSITIVITY_MIN,
+            VIEW_SENSITIVITY_MAX,
+            (panel_radius, panel_radius, 0.0, 0.0),
         ):
             hovered_tip = "ZBrush 模式下的视图缩放敏感度"
 
         font_id = 0
-        title_size = 9.0 * ui
+        title_size = 10.0 * ui
         blf.size(font_id, max(8, int(title_size)))
-        _title_width, title_text_height = blf.dimensions(font_id, "zbrush")
+        _title_width, title_text_height = blf.dimensions(font_id, "Z B R U S H")
         _draw_text_2d(
-            title_rect[0] + _px(context, 8),
+            title_rect[0] + _px(context, 10),
             title_rect[1] + (title_rect[3] - title_text_height) * 0.5,
-            "zbrush",
+            "Z B R U S H",
             title_size,
-            (0.92, 0.94, 0.98, 1.0),
+            colors["text"],
         )
-        grip_x = title_rect[0] + title_rect[2] - _px(context, 12)
+        grip_x = title_rect[0] + title_rect[2] - _px(context, 14)
         grip_y = title_rect[1] + title_rect[3] * 0.5 - _px(context, 5)
         for row in range(3):
             for col in range(2):
@@ -3668,8 +3953,60 @@ def draw_move_mode_gizmo():
     gpu.state.blend_set("NONE")
 
 
+def draw_mask_loop_preview():
+    preview = MASK_LOOP_PREVIEW
+    context = bpy.context
+    if (
+        preview is None
+        or not is_zbrush_sculpt_mode(context)
+        or context.area is None
+        or context.region is None
+        or preview.get("area_pointer") != context.area.as_pointer()
+    ):
+        return
+
+    obj = bpy.data.objects.get(preview.get("object_name"))
+    if obj is None or obj.type != "MESH":
+        return
+
+    positions = []
+    matrix = obj.matrix_world
+    vertices = obj.data.vertices
+    for edge_index in preview.get("edges", ()):
+        if edge_index >= len(obj.data.edges):
+            continue
+        edge = obj.data.edges[edge_index]
+        vertex_a, vertex_b = edge.vertices
+        screen_a = _to_screen(context, matrix @ vertices[vertex_a].co)
+        screen_b = _to_screen(context, matrix @ vertices[vertex_b].co)
+        if screen_a is None or screen_b is None:
+            continue
+        positions.extend(((screen_a.x, screen_a.y), (screen_b.x, screen_b.y)))
+    if not positions:
+        return
+
+    try:
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        batch = batch_for_shader(shader, "LINES", {"pos": positions})
+        gpu.state.blend_set("ALPHA")
+        gpu.state.line_width_set(max(1.0, _px(context, 5.0)))
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.32, 0.02, 0.24))
+        batch.draw(shader)
+        gpu.state.line_width_set(max(1.0, _px(context, 2.0)))
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.58, 0.08, 1.0))
+        batch.draw(shader)
+    except Exception as exc:
+        _draw_error(context, "mask loop preview", exc)
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set("NONE")
+
+
 def draw_zb_overlays():
-    """The single POST_PIXEL handler for the floating panel and move gizmo."""
+    """The single POST_PIXEL handler for mask preview, panel and move gizmo."""
+    draw_mask_loop_preview()
     draw_floating_tool_panel()
     draw_move_mode_gizmo()
 
@@ -3729,7 +4066,9 @@ CLASSES = (
     ZBNAV_AddonPreferences,
     ZBNAV_OT_pan_or_zoom,
     ZBNAV_OT_alt_select_target,
-    ZBNAV_OT_brush_size_drag,
+    ZBNAV_OT_mask_loop,
+    ZBNAV_OT_mask_invert,
+    ZBNAV_OT_mask_clear,
     ZBNAV_OT_set_navigation_mode,
     ZBNAV_OT_tool_shortcut,
     ZBNAV_OT_gizmo_hover_monitor,
@@ -3755,20 +4094,20 @@ def register():
 def unregister():
     global GIZMO_HOVER_MONITOR_RUNNING
     GIZMO_HOVER_MONITOR_RUNNING = False
+    _clear_mask_loop_preview()
     _restore_all_isolation()
     FLOATING_PANEL_STATES.clear()
     _restore_rotate_method(bpy.context)
     if bpy.app.handlers.depsgraph_update_post.count(_sculpt_mode_handler):
         bpy.app.handlers.depsgraph_update_post.remove(_sculpt_mode_handler)
     try:
-        if bpy.app.timers.is_registered(_trigger_key_sync_timer):
-            bpy.app.timers.unregister(_trigger_key_sync_timer)
+        if bpy.app.timers.is_registered(_mode_shortcut_sync_timer):
+            bpy.app.timers.unregister(_mode_shortcut_sync_timer)
         if bpy.app.timers.is_registered(_capslock_watch_timer):
             bpy.app.timers.unregister(_capslock_watch_timer)
     except (AttributeError, ValueError):
         pass
     remove_zbrush_keymaps()
-    _restore_trigger_key()
     _restore_mode_shortcuts()
     restore_sculpt_brush_modifiers()
     unregister_view3d_draw_handler()
